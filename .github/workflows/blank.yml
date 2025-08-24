@@ -1,0 +1,31 @@
+name: Monitoramento de Passagens Aéreas
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'  # Executa a cada 4 horas
+  workflow_dispatch:        # Permite execução manual
+
+jobs:
+  monitor-passagens:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Fazer checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Instalar dependências
+        run: pip install requests beautifulsoup4
+
+      - name: Executar monitoramento
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor_passagens.py
+
+      - name: Registrar execução
+        run: echo "Monitoramento executado em $(date)" >> log.txt
