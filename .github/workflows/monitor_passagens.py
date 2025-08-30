@@ -1,11 +1,11 @@
+# No seu repositório local
+cat > monitor_passagens.py << 'EOF'
 import os
 import requests
 from datetime import datetime, timedelta
-
 # Configurações
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
-
 def enviar_telegram(mensagem):
     """Envia mensagem via Telegram"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -19,7 +19,6 @@ def enviar_telegram(mensagem):
         return response.status_code == 200
     except:
         return False
-
 def simular_busca():
     """Simula busca de passagens"""
     destinos = ["FOR", "SSA", "REC", "NAT", "BSB", "CGH", "GIG"]
@@ -38,7 +37,6 @@ def simular_busca():
             })
     
     return ofertas
-
 def main():
     print(f"Iniciando monitoramento em {datetime.now()}")
     
@@ -54,7 +52,6 @@ def main():
 💰 <b>Preço total (4 pessoas):</b> R$ {oferta['preco']},00
 👥 <b>2 Adultos + 2 Crianças</b>
 🔗 <b>Verifique no site da companhia</b>
-
 <i>Monitorado via GitHub Actions</i>
 """
         if enviar_telegram(mensagem):
@@ -64,6 +61,11 @@ def main():
     
     if not ofertas:
         print("Nenhuma promoção encontrada")
-
 if __name__ == "__main__":
     main()
+EOF
+
+# Fazer commit e push
+git add monitor_passagens.py
+git commit -m "Adicionar script de monitoramento de passagens"
+git push origin main
