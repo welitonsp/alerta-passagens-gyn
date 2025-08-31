@@ -2,12 +2,17 @@ name: Monitoramento de Passagens Aéreas
 
 on:
   schedule:
-    - cron: "0 */4 * * *"     # a cada 4h (UTC)
+    - cron: "0 */4 * * *"   # a cada 4h (UTC)
   workflow_dispatch:
+
+permissions:
+  contents: write   # precisa para comitar data/history.csv
 
 jobs:
   monitor-passagens:
     runs-on: ubuntu-latest
+    concurrency: monitor-passagens
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -21,9 +26,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install requests
 
-      # --- Teste rápido: manda msg no Telegram p/ validar segredos ---
       - name: Ping Telegram (teste)
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -31,31 +35,38 @@ jobs:
         run: |
           python - <<'PY'
           import os, requests, sys
-          token = os.getenv("BOT_TOKEN")
-          chat  = os.getenv("CHAT_ID")
-          if not token or not chat:
-              sys.exit("Faltam BOT_TOKEN/CHAT_ID")
-          url = f"https://api.telegram.org/bot{token}/sendMessage"
-          r = requests.post(url, json={"chat_id": chat, "text": "✅ GitHub Actions conectado ao Telegram."}, timeout=20)
-          r.raise_for_status()
-          print("OK:", r.json().get("ok"))
+          t=os.getenv("BOT_TOKEN"); c=os.getenv("CHAT_ID")
+          if not t or not c: sys.exit("Faltam BOT_TOKEN/CHAT_ID")
+          r=requests.post(f"https://api.telegram.org/bot{t}/sendMessage",
+                          json={"chat_id": int(c), "text": "✅ Conectado ao Telegram."}, timeout=20)
+          print("HTTP", r.status_code, r.text[:200]); r.raise_for_status()
           PY
 
-      - name: Run monitor
+      - name: Run monitor (Kiwi + baseline)
         env:
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          ORIGEM:    GYN
-          DESTINOS:  FOR,SSA,REC,NAT,BSB,CGH,GIG
+          BOT_TOKEN:      ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID:        ${{ secrets.TELEGRAM_CHAT_ID }}
+          KIWI_API_KEY:   ${{ secrets.KIWI_API_KEY }}
+
+          # ---- parâmetros que você pode ajustar depois ----
+          DESTINOS: RBR,MCZ,MCP,MAO,SSA,FOR,BSB,VIX,SLZ,CGB,CGR,CNF,BEL,JPA,CWB,REC,THE,GIG,SDU,NAT,POA,PVH,BVB,FLN,GRU,CGH,AJU,PMW,VCP,IGU,RAO,UDI
+          DAYS_AHEAD_FROM: "10"
+          DAYS_AHEAD_TO:   "90"
+          STAY_NIGHTS_MIN: "5"
+          STAY_NIGHTS_MAX: "10"
+          MAX_STOPOVERS:   "1"
+
+          # Critérios de oportunidade
+          MAX_PRECO_PP:      "1200"
+          MIN_DISCOUNT_PCT:  "0.25"
+          MIN_DAYDROP_PCT:   "0.30"
+          BASELINE_WINDOW_DAYS: "30"
+          BIN_SIZE_DAYS:        "7"
+          MAX_PER_DEST:         "1"
         run: python monitor_passagens.py
 
-      - name: Append run log
-        run: echo "Monitoramento executado em $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> log.txt
-
-      - name: Upload log
-        uses: actions/upload-artifact@v4
+      - name: Commit histórico (se mudou)
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          name: log-monitor-passagens
-          path: log.txt
-          if-no-files-found: warn
-
+          commit_message: "chore(monitor): atualizar histórico de preços"
+          file_pattern: data/history.csv
