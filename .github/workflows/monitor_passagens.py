@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Monitor de passagens aéreas (Amadeus Self-Service API) – Versão Aprimorada e Robusta
+Monitor de passagens aéreas (Amadeus Self-Service API) – Versão robusta + link do Google Flights
 
 • Fonte: Amadeus Flight Offers Search (OAuth2 + GET /v2/shopping/flight-offers)
-• Origem fixa: GYN (ajustável por env ORIGEM)
-• Destinos: capitais/cidades (ajustável por env DESTINOS)
-• PAX: 2 adultos + 2 crianças (ajustável)
-• Critérios de oportunidade: baseline por bucket + daydrop por data + teto de preço
+• Origem/rotas configuráveis via env
+• Baseline por bucket + daydrop por data + teto de preço
 • Histórico: data/history.csv
-• Alertas: Telegram (BOT_TOKEN + CHAT_ID)
+• Alertas: Telegram
+• Link direto: Google Flights nas datas corretas
 
 Requisitos:
-  - requests >= 2.31.0
-Secrets esperados no GitHub:
-  - TELEGRAM_BOT_TOKEN (exportado como BOT_TOKEN no job)
-  - TELEGRAM_CHAT_ID (exportado como CHAT_ID no job)
+  - requests>=2.31.0
+Secrets esperados (GitHub → Settings → Secrets → Actions):
+  - TELEGRAM_BOT_TOKEN  (exportado como BOT_TOKEN no job)
+  - TELEGRAM_CHAT_ID    (exportado como CHAT_ID)
   - AMADEUS_API_KEY
   - AMADEUS_API_SECRET
 """
@@ -33,6 +32,7 @@ from datetime import datetime, timedelta, timezone, date
 from typing import List, Dict, Any, Tuple, Optional
 from statistics import mean, stdev
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote_plus  # ← para montar link do Google Flights
 
 # ---------------------------- Logging ----------------------------
 logging.basicConfig(
@@ -80,13 +80,13 @@ class Config:
     MIN_DAYDROP_PCT      = float(os.getenv('MIN_DAYDROP_PCT', '0.30'))
     BASELINE_WINDOW_DAYS = int(os.getenv('BASELINE_WINDOW_DAYS','30'))
     BIN_SIZE_DAYS        = int(os.getenv('BIN_SIZE_DAYS', '7'))
-    MAX_PER_DEST         = int(os.getenv('MAX_PER_DEST', '1'))   # limite global de alertas (1 = top geral)
-    MAX_STOPOVERS        = int(os.getenv('MAX_STOPOVERS', '99')) # filtro opcional por nº máx de conexões/paradas
+    MAX_PER_DEST         = int(os.getenv('MAX_PER_DEST', '1'))   # nº máximo total de alertas por rodada
+    MAX_STOPOVERS        = int(os.getenv('MAX_STOPOVERS', '99')) # filtro por conexões/paradas
 
     # Passageiros
     ADULTS   = int(os.getenv('ADULTS', '2'))
     CHILDREN = int(os.getenv('CHILDREN', '2'))
-    # Amadeus aceita idades de crianças – ajuste se precisar
+    # (Amadeus aceita idades, mas não estamos usando nas chamadas GET)
     CHILDREN_AGES = [int(x) for x in os.getenv('CHILDREN_AGES', '4,8').split(',')]
     PAX_TOTAL = ADULTS + CHILDREN
 
@@ -136,6 +136,26 @@ class Utils:
         return connections + tech_stops
 
 
+# ============================== LINKS (Google Flights) ==============================
+class Links:
+    @staticmethod
+    def google_flights_roundtrip(origin: str, dest: str, dep: date, ret: date,
+                                 currency: str = Config.CURRENCY, lang: str = "pt-BR") -> str:
+        """
+        Abre a rota ida+volta já nas datas certas no Google Flights.
+        Formato do âncora: #flt=ORIG.DEST.YYYY-MM-DD*DEST.ORIG.YYYY-MM-DD;c:BRL
+        """
+        anchor = f"{origin}.{dest}.{dep.isoformat()}*{dest}.{origin}.{ret.isoformat()};c:{currency}"
+        return f"https://www.google.com/travel/flights?hl={lang}&curr={currency}#flt={anchor}"
+
+    @staticmethod
+    def google_flights_fallback(origin: str, dest: str, dep: date, ret: date,
+                                currency: str = Config.CURRENCY, lang: str = "pt-BR") -> str:
+        # Fallback textual caso o formato #flt mude no futuro
+        q = f"Flights from {origin} to {dest} on {dep.isoformat()} returning on {ret.isoformat()} currency {currency}"
+        return f"https://www.google.com/travel/flights?hl={lang}&curr={currency}&q={quote_plus(q)}"
+
+
 # ============================== CACHE (simples em memória) ==============================
 class Cache:
     _cache_lock = threading.Lock()
@@ -149,7 +169,6 @@ class Cache:
                 return None
             if time.time() < item['expiry']:
                 return item['value']
-            # expirado
             del cls._api_cache[key]
             return None
 
@@ -196,8 +215,8 @@ class AmadeusAPI:
     def search_roundtrip_get(cls, origin: str, dest: str, dep: date, ret: date, max_results: int = 10) -> List[Dict[str, Any]]:
         """
         GET /v2/shopping/flight-offers
-        Parâmetros usados: originLocationCode, destinationLocationCode, departureDate, returnDate, adults, children, currencyCode, max
-        Retorno simplificado por offer:
+        Params: originLocationCode, destinationLocationCode, departureDate, returnDate, adults, children, currencyCode, max
+        Retorna lista simplificada por offer:
           { price_total, price_pp, stopovers, airlines }
         """
         cache_key = f"{origin}_{dest}_{dep.isoformat()}_{ret.isoformat()}"
@@ -260,7 +279,7 @@ class AmadeusAPI:
                 return enhanced
 
             except requests.RequestException as e:
-                logging.error(f'Erro Amadeus para {origin}->{dest} ({dep}->{ret}) (tentativa {attempt+1}): {e}')
+                logging.error(f'Erro Amadeus {origin}->{dest} ({dep}->{ret}) (tentativa {attempt+1}): {e}')
                 if attempt == 2:
                     return []
                 time.sleep(2)
@@ -283,7 +302,6 @@ class History:
                     r['date_out'] = datetime.fromisoformat(r['date_out']).date()
                     out.append(r)
                 except Exception:
-                    # Ignora linhas inválidas
                     continue
         return out
 
@@ -304,7 +322,6 @@ class History:
                 w.writeheader()
             for r in rows:
                 row = dict(r)
-                # Serializa lista de cias para legibilidade no CSV
                 if isinstance(row.get('airlines'), list):
                     row['airlines'] = '|'.join(row['airlines'])
                 w.writerow(row)
@@ -329,7 +346,7 @@ class TrendAnalyzer:
     def calculate_trend(self, dest: str, bucket: str) -> Dict[str, float]:
         key = (dest, bucket)
         relevant = self.prices_by_bucket.get(key, [])
-        relevant.sort(key=lambda x: x[0])  # por timestamp
+        relevant.sort(key=lambda x: x[0])
 
         if len(relevant) < 2:
             return {'mean': float('inf'), 'std_dev': 0.0, 'trend_7d': 0.0, 'trend_30d': 0.0}
@@ -409,7 +426,7 @@ class FlightScraper:
                             'price_total': f'{price_total:.2f}',
                             'price_pp': f'{pp:.2f}',
                             'provider': 'amadeus',
-                            'deep_link': '',
+                            'deep_link': Links.google_flights_roundtrip(Config.ORIGEM, dest, dep, ret),
                             'airlines': offer.get('airlines', []),
                         })
                 except Exception as e:
@@ -475,15 +492,13 @@ class FlightMonitor:
         return None
 
     def _find_opportunities(self, obs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        # 1) escolhe a melhor por destino (menor price_pp)
+        # 1) melhor por destino (menor preço/pax)
         melhores_por_dest: Dict[str, Dict[str, Any]] = {}
         for o in obs:
             dest = o['dest']
             price_pp = float(o['price_pp'])
-            # filtro opcional por conexões
             if int(o.get('stopovers', 0)) > Config.MAX_STOPOVERS:
                 continue
-
             item = {
                 'dest': dest,
                 'price_total': float(o['price_total']),
@@ -495,6 +510,7 @@ class FlightMonitor:
                 'dep_date': datetime.fromisoformat(o['date_out']).date(),
                 'stopovers': int(o['stopovers']),
                 'airlines': o.get('airlines', []),
+                'deep_link': o.get('deep_link', ''),
             }
             if dest not in melhores_por_dest or price_pp < melhores_por_dest[dest]['price_pp']:
                 melhores_por_dest[dest] = item
@@ -505,9 +521,7 @@ class FlightMonitor:
         for dest, it in melhores_por_dest.items():
             base = self._baseline(dest, it['bucket'], now)
             discount = (base - it['price_pp']) / base if math.isfinite(base) and base > 0 else 0.0
-
             daydrop = self._daydrop(dest, it['dep_date']) or 0.0
-
             if (it['price_pp'] <= Config.MAX_PRECO_PP) and (discount >= Config.MIN_DISCOUNT_PCT or daydrop >= Config.MIN_DAYDROP_PCT):
                 trend = self.trend_analyzer.calculate_trend(dest, it['bucket'])
                 it.update({
@@ -518,7 +532,7 @@ class FlightMonitor:
                 })
                 oportunidades.append(it)
 
-        # 3) ordena e aplica limite global (MAX_PER_DEST = nº máximo de alertas)
+        # 3) ordena e aplica limite total
         oportunidades.sort(key=lambda x: (-x['discount'], x['price_pp']))
         if Config.MAX_PER_DEST > 0:
             oportunidades = oportunidades[:Config.MAX_PER_DEST]
@@ -539,8 +553,10 @@ class FlightMonitor:
             f'↘️ <b>Queda diária:</b> {o["daydrop"]*100:.1f}%',
             f'<i>Tendência 7d: {o["trend_7d"]:+.1f}%</i>',
             f'<i>Tendência 30d: {o["trend_30d"]:+.1f}%</i>',
-            '<i>Fonte: Amadeus (Self-Service API) • Monitor via GitHub Actions</i>'
         ]
+        if o.get('deep_link'):
+            linhas.append(f'🔗 <a href="{o["deep_link"]}">Abrir no Google Flights</a>')
+        linhas.append('<i>Fonte: Amadeus (Self-Service API) • Monitor via GitHub Actions</i>')
         return '\n'.join(linhas)
 
     def run(self):
