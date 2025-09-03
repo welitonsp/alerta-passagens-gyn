@@ -1,8 +1,8 @@
-name: Monitoramento de Passagens (Amadeus)
+lname: Monitoramento de Passagens (Amadeus)
 
 on:
   schedule:
-    - cron: "0 */4 * * *"   # a cada 4h (UTC)
+    - cron: "0 */4 * * *"   # roda a cada 4h (UTC)
   workflow_dispatch:        # permite rodar manualmente
 
 permissions:
@@ -44,24 +44,29 @@ jobs:
 
       - name: Run monitor (Amadeus)
         env:
+          # --- secrets obrigatórios ---
           BOT_TOKEN:            ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID:              ${{ secrets.TELEGRAM_CHAT_ID }}
           AMADEUS_API_KEY:      ${{ secrets.AMADEUS_API_KEY }}
           AMADEUS_API_SECRET:   ${{ secrets.AMADEUS_API_SECRET }}
-          # ---- parâmetros (ajuste à vontade) ----
+
+          # --- parâmetros ajustáveis ---
+          ORIGEM: GYN
           DESTINOS: SSA,FOR,REC,GRU,CGH,VCP
           DAYS_AHEAD_FROM: "10"
           DAYS_AHEAD_TO:   "90"
           STAY_NIGHTS_MIN: "5"
           STAY_NIGHTS_MAX: "10"
-          SAMPLE_DEPARTURES: "3"
+          SAMPLE_DEPARTURES: "3"   # reduzir se tomar 429
           SAMPLE_STAYS:      "2"
           MAX_PRECO_PP:      "1200"
           MIN_DISCOUNT_PCT:  "0.25"
           MIN_DAYDROP_PCT:   "0.30"
           BIN_SIZE_DAYS:     "7"
-          MAX_PER_DEST:      "1"
-          # AMADEUS_BASE_URL: https://test.api.amadeus.com   # (padrão)
+          MAX_PER_DEST:      "1"    # nº máximo de alertas por rodada
+          MAX_STOPOVERS:     "1"    # filtra ofertas com muitas conexões
+          CURRENCY:          "BRL"
+          # AMADEUS_BASE_URL: https://api.amadeus.com  # descomente quando for para produção
         run: python monitor_passagens.py
 
       - name: Commit histórico (se mudou)
