@@ -1,8 +1,8 @@
-lname: Monitoramento de Passagens (Amadeus)
+name: Monitoramento de Passagens (Amadeus)
 
 on:
   schedule:
-    - cron: "0 */4 * * *"   # roda a cada 4h (UTC)
+    - cron: "0 */4 * * *"   # executa a cada 4h (UTC)
   workflow_dispatch:        # permite rodar manualmente
 
 permissions:
@@ -57,17 +57,17 @@ jobs:
           DAYS_AHEAD_TO:   "90"
           STAY_NIGHTS_MIN: "5"
           STAY_NIGHTS_MAX: "10"
-          SAMPLE_DEPARTURES: "3"   # reduzir se tomar 429
+          SAMPLE_DEPARTURES: "3"
           SAMPLE_STAYS:      "2"
           MAX_PRECO_PP:      "1200"
           MIN_DISCOUNT_PCT:  "0.25"
           MIN_DAYDROP_PCT:   "0.30"
           BIN_SIZE_DAYS:     "7"
-          MAX_PER_DEST:      "1"    # nº máximo de alertas por rodada
-          MAX_STOPOVERS:     "1"    # filtra ofertas com muitas conexões
+          MAX_PER_DEST:      "1"
+          MAX_STOPOVERS:     "1"        # ignora ofertas com >1 conexão/parada
           CURRENCY:          "BRL"
-          # AMADEUS_BASE_URL: https://api.amadeus.com  # descomente quando for para produção
-        run: python monitor_passagens.py
+          # AMADEUS_BASE_URL: https://api.amadeus.com   # quando migrar p/ produção
+        run: python .github/workflows/monitor_passagens.py
 
       - name: Commit histórico (se mudou)
         uses: stefanzweifel/git-auto-commit-action@v5
