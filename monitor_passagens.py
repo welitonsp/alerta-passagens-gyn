@@ -3,7 +3,7 @@ Monitoramento de Passagens Aéreas (Amadeus + Telegram)
 
 - Configuração via classe Config (origem, destinos, parâmetros).
 - Autenticação OAuth2 na Amadeus.
-- Busca ofertas de voo e identifica a mais barata.
+- Busca ofertas de voo e identifica a mais barata em datas dinâmicas.
 - Envia resumo via Telegram.
 
 Requer segredos configurados no GitHub Actions:
@@ -16,7 +16,8 @@ Requer segredos configurados no GitHub Actions:
 import os
 import sys
 import requests
-from datetime import datetime
+import random
+from datetime import datetime, timedelta
 
 
 # ----------------------------------------------------------------------
@@ -31,16 +32,7 @@ class Config:
 
     DAYS_AHEAD_FROM = 10
     DAYS_AHEAD_TO = 90
-    STAY_NIGHTS_MIN = 5
-    STAY_NIGHTS_MAX = 10
-    SAMPLE_DEPARTURES = 3
-    SAMPLE_STAYS = 2
-    MAX_PRECO_PP = 1200
-    MIN_DISCOUNT_PCT = 0.25
-    MIN_DAYDROP_PCT = 0.30
-    BIN_SIZE_DAYS = 7
-    MAX_PER_DEST = 1
-    MAX_STOPOVERS = 1
+    SAMPLE_DEPARTURES = 3   # quantas datas testar por destino
     CURRENCY = "BRL"
 
 
@@ -109,31 +101,30 @@ def buscar_passagens(token, origem, destino, data):
     resp = requests.get(url, headers=headers, params=params, timeout=60)
 
     if resp.status_code != 200:
-        log(f"Erro na busca de {origem}->{destino}: {resp.status_code} {resp.text}", 'ERROR')
+        log(f"Erro na busca de {origem}->{destino} em {data}: {resp.status_code} {resp.text}", 'ERROR')
         return None
 
     return resp.json()
 
+
 def find_cheapest_offer(offers):
     """Encontra a oferta mais barata em uma lista de ofertas da Amadeus."""
-    if not offers or "data" not in offers:
+    if not offers or "data" not in offers or not offers["data"]:
         return None
-    
-    cheapest = min(offers["data"], key=lambda x: float(x["price"]["total"]))
-    return cheapest
+    return min(offers["data"], key=lambda x: float(x["price"]["total"]))
 
-def format_cheapest_offer(cheapest_offer, origem, destino):
-    """Formata uma mensagem concisa para a oferta mais barata."""
+
+def format_cheapest_offer(cheapest_offer, origem, destino, data):
+    """Formata mensagem concisa para a oferta mais barata."""
     if not cheapest_offer:
-        return f"❌ Nenhuma oferta encontrada para {origem} → {destino}."
+        return f"❌ Nenhuma oferta encontrada para {origem} → {destino} em {data}."
 
     price = float(cheapest_offer["price"]["total"])
     currency = cheapest_offer["price"]["currency"]
-    
-    # Obtém a data de partida do primeiro segmento do primeiro itinerário
-    departure_date = cheapest_offer["itineraries"][0]["segments"][0]["departure"]["at"][:10]
 
-    return f"✈️ Oferta mais barata {origem} → {destino}: {price:.2f} {currency} em {departure_date}."
+    departure_date = cheapest_offer["itineraries"][0]["segments"][0]["departure"]["at"][:10]
+    return f"✈️ Mais barato {origem} → {destino} em {departure_date}: {price:.2f} {currency}."
+
 
 # ----------------------------------------------------------------------
 # Telegram
@@ -160,14 +151,39 @@ def enviar_telegram(msg: str):
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
-def process_destination(token, origem, destino, departure_date):
-    """Processa um único destino e envia uma mensagem via Telegram."""
-    log(f"Buscando voos para {destino}...")
-    ofertas = buscar_passagens(token, origem, destino, departure_date)
-    cheapest = find_cheapest_offer(ofertas)
-    resumo = format_cheapest_offer(cheapest, origem, destino)
+def gerar_datas():
+    """Gera lista de datas dentro do intervalo configurado."""
+    hoje = datetime.today()
+    datas = []
+    for _ in range(Config.SAMPLE_DEPARTURES):
+        delta = random.randint(Config.DAYS_AHEAD_FROM, Config.DAYS_AHEAD_TO)
+        datas.append((hoje + timedelta(days=delta)).strftime("%Y-%m-%d"))
+    return datas
+
+
+def process_destination(token, origem, destino):
+    """Processa destino para várias datas e envia a mais barata."""
+    log(f"🔎 Buscando voos {origem} → {destino}...")
+
+    melhores = []
+    for data in gerar_datas():
+        ofertas = buscar_passagens(token, origem, destino, data)
+        cheapest = find_cheapest_offer(ofertas)
+        if cheapest:
+            melhores.append((cheapest, data))
+
+    if not melhores:
+        msg = f"❌ Nenhuma oferta encontrada para {origem} → {destino} nas datas testadas."
+        log(msg)
+        enviar_telegram(msg)
+        return
+
+    # Pega o mais barato de todas as datas testadas
+    oferta_barata, data = min(melhores, key=lambda x: float(x[0]["price"]["total"]))
+    resumo = format_cheapest_offer(oferta_barata, origem, destino, data)
     log(resumo)
     enviar_telegram(resumo)
+
 
 def main():
     log(f"Iniciando monitor (ENV={ENV}, BASE={BASE})")
@@ -176,12 +192,9 @@ def main():
         token = get_token()
         log("Token obtido com sucesso.", 'SUCCESS')
 
-        # Substitua '2025-12-15' por uma data dinâmica se necessário
-        departure_date = "2025-12-15" 
-
         for destino in Config.DESTINOS:
-            process_destination(token, Config.ORIGEM, destino, departure_date)
-            
+            process_destination(token, Config.ORIGEM, destino)
+
         log("Execução do monitor finalizada.", 'SUCCESS')
 
     except Exception as e:
@@ -191,4 +204,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
