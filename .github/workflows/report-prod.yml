@@ -1,8 +1,8 @@
-name: Relatório Diário (PROD)
+name: Relatório Diário de Preços
 
 on:
   schedule:
-    - cron: "0 12 * * *"   # 12:00 UTC (~09:00 America/Sao_Paulo)
+    - cron: "0 12 * * *"  # todo dia às 12:00 UTC
   workflow_dispatch:
 
 permissions:
@@ -25,18 +25,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Gerar e enviar relatório (produção)
+      - name: Gerar e enviar relatório
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-
-          ORIGEM: GYN
-          REPORT_ONLY_YESTERDAY: "true"         # ontem
-          REPORT_USE_BRAZIL_LOCAL_DAY: "false"  # true = ontem no horário BR
-          REPORT_COMPARE: "true"                # compara com período anterior
-          REPORT_COMPARE_WINDOW_DAYS: "1"       # anteontem
-          REPORT_TOP_K: "15"
-          REPORT_TITLE: "📊 Relatório diário — menores preços (PROD)"
-          REPORT_PARSE_MODE: "MarkdownV2"       # "", "Markdown", "MarkdownV2"
-          REPORT_INCLUDE_LINKS: "true"
-        run: python gerar_relatorio.py
+          HISTORY_PATH:       data/history.csv
+        run: |
+          python gerar_relatorio.py
