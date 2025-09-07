@@ -2,18 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Monitoramento de Passagens Aéreas (Amadeus + Telegram)
+Monitoramento de Passagens Aéreas (Amadeus + Telegram) - Produção
 
 - Lê variáveis de ambiente
 - Obtém token OAuth2 da Amadeus
 - Busca ofertas (v2/shopping/flight-offers)
-- Aplica regras de alerta
-- Envia para Telegram
+- Aplica regras de alerta (queda % > teto)
+- Envia para Telegram (com companhia e link)
 - Persiste histórico em data/history.csv
-
-OBS: O ambiente (sandbox x produção) é definido por AMADEUS_ENV:
-- "test"  -> https://test.api.amadeus.com  (padrão)
-- "production" -> https://api.amadeus.com
 """
 
 from __future__ import annotations
@@ -35,28 +31,22 @@ import requests
 class Config:
     ORIGEM = os.getenv("ORIGEM", "GYN").strip().upper()
 
-    # Todas as capitais do Brasil (IATA)
-    DESTINOS = list(dict.fromkeys(os.getenv(
-        "DESTINOS",
-        "RIO,SSA,FOR,REC,GRU,CGH,VCP,BSB,POA,FLN,CWB,BEL,MAO,SLZ,THE,NAT,MCZ,AJU,BPS,PVH,BOA,CGB,CGR,GIG,SDU,IGU,JKD"
-    ).replace(" ", "").split(",")))
-    # Ajuste rápido de aliases mais conhecidos
-    ALIASES = {
-        "RIO": ["GIG", "SDU"],
-    }
-    # Expande "RIO" para GIG/SDU se presente
-    if "RIO" in DESTINOS:
-        DESTINOS = [c for c in DESTINOS if c != "RIO"] + ALIASES["RIO"]
-    DESTINOS = [d for d in DESTINOS if d]  # limpa vazios
-    DESTINOS = list(dict.fromkeys(DESTINOS))  # únicos preservando ordem
+    DESTINOS = list(dict.fromkeys(
+        (os.getenv(
+            "DESTINOS",
+            "GIG,SDU,SSA,FOR,REC,NAT,MCZ,AJU,MAO,BEL,SLZ,THE,BSB,FLN,POA,CWB,CGR,CGB,CNF,VIX,JPA,PMW,PVH,BVB,RBR,GYN,GRU,CGH"
+        )).replace(" ", "").split(",")
+    ))
+    DESTINOS = [d for d in DESTINOS if d]
+    DESTINOS = list(dict.fromkeys(DESTINOS))
 
     DAYS_AHEAD_FROM = int(os.getenv("DAYS_AHEAD_FROM", "10"))
-    DAYS_AHEAD_TO = int(os.getenv("DAYS_AHEAD_TO", "90"))
-    SAMPLE_DEPARTURES = int(os.getenv("SAMPLE_DEPARTURES", "3"))
+    DAYS_AHEAD_TO   = int(os.getenv("DAYS_AHEAD_TO", "90"))
+    SAMPLE_DEPARTURES = int(os.getenv("SAMPLE_DEPARTURES", "2"))
     CURRENCY = os.getenv("CURRENCY", "BRL")
 
     MAX_OFFERS = int(os.getenv("MAX_OFFERS", "5"))
-    REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.8"))  # anti rate limit
+    REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.2"))  # anti rate limit
 
 # =========================
 # Ambiente / endpoints
@@ -184,7 +174,7 @@ def buscar_passagens(token: str, origem: str, destino: str, data: str):
         return None
 
 def find_cheapest_offer(offers):
-    """Retorna a oferta mais barata + 'airline' resolvida (operating > marketing)."""
+    """Retorna a oferta mais barata + 'airline' (operating > marketing) e 'deeplink' básico."""
     if not offers or "data" not in offers or not offers["data"]:
         return None
     try:
@@ -200,13 +190,12 @@ def find_cheapest_offer(offers):
         pass
     cheapest["airline"] = airline
 
-    # opcional: construir um link simples (quando houver informações)
     cheapest["deeplink"] = ""
     try:
-        dep = cheapest["itineraries"][0]["segments"][0]["departure"]["iataCode"]
-        arr = cheapest["itineraries"][0]["segments"][-1]["arrival"]["iataCode"]
+        dep_iata = cheapest["itineraries"][0]["segments"][0]["departure"]["iataCode"]
+        arr_iata = cheapest["itineraries"][0]["segments"][-1]["arrival"]["iataCode"]
         ddate = cheapest["itineraries"][0]["segments"][0]["departure"]["at"][:10]
-        cheapest["deeplink"] = f"https://www.google.com/travel/flights?q=Flights%20{dep}%20to%20{arr}%20{ddate}"
+        cheapest["deeplink"] = f"https://www.google.com/travel/flights?q=Flights%20{dep_iata}%20to%20{arr_iata}%20{ddate}"
     except Exception:
         pass
 
@@ -217,8 +206,8 @@ def find_cheapest_offer(offers):
 # =========================
 def deve_alertar(preco_atual: float, melhor_anterior: float | None):
     """
-    Ordem das regras:
-    1) Queda porcentual (comparado ao melhor preço observado)
+    Ordem:
+    1) Queda porcentual (comparada ao melhor preço observado)
     2) Teto absoluto
     """
     if melhor_anterior is not None and melhor_anterior not in (0, float("inf")):
