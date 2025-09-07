@@ -2,103 +2,111 @@
 # -*- coding: utf-8 -*-
 
 """
-Monitoramento de Passagens Aéreas (Amadeus + Telegram) - Produção
+Monitoramento de Passagens Aéreas (Amadeus + Telegram) — SANDBOX por padrão.
 
-- Lê variáveis de ambiente
-- Obtém token OAuth2 da Amadeus
-- Busca ofertas (v2/shopping/flight-offers)
-- Aplica regras de alerta (queda % > teto)
-- Envia para Telegram (com companhia e link)
-- Persiste histórico em data/history.csv
+- Busca ofertas em datas aleatórias nos próximos N dias.
+- Encontra a mais barata por destino e envia para o Telegram.
+- Salva histórico em CSV.
+- Extrai nome da companhia quando disponível (via dictionaries.carriers).
+
+Produção só é ativada se:
+  AMADEUS_ENV=production  e  ALLOW_PROD=1
 """
 
-from __future__ import annotations
-
-import csv
 import os
-import random
 import sys
+import csv
 import time
+import random
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict, Tuple
-
 import requests
 
-# =========================
+# -----------------------
+# Ambiente (TRAVADO)
+# -----------------------
+ENV_RAW = (os.getenv("AMADEUS_ENV") or "sandbox").strip().lower()
+ALLOW_PROD = (os.getenv("ALLOW_PROD", "0").strip().lower() in ("1", "true", "yes"))
+ENV = "production" if (ENV_RAW in ("production", "prod") and ALLOW_PROD) else "sandbox"
+BASE_URL = "https://api.amadeus.com" if ENV == "production" else "https://test.api.amadeus.com"
+
+# -----------------------
+# Credenciais & Telegram
+# -----------------------
+CLIENT_ID = os.getenv("AMADEUS_API_KEY")
+CLIENT_SECRET = os.getenv("AMADEUS_API_SECRET")
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# -----------------------
 # Config
-# =========================
+# -----------------------
+def brazil_capitals_iata():
+    # Capitais + hubs mais comuns (GRU/CGH incluídos)
+    return [
+        "GIG","SDU","SSA","FOR","REC","NAT","MCZ","AJU",
+        "MAO","BEL","SLZ","THE","BSB","FLN","POA","CWB",
+        "CGR","CGB","CNF","VIX","JPA","PMW","PVH","BVB",
+        "RBR","GYN","GRU","CGH"
+    ]
+
+def dedupe_keep_order(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
 class Config:
     ORIGEM = os.getenv("ORIGEM", "GYN").strip().upper()
-
-    DESTINOS = list(dict.fromkeys(
-        (os.getenv(
-            "DESTINOS",
-            "GIG,SDU,SSA,FOR,REC,NAT,MCZ,AJU,MAO,BEL,SLZ,THE,BSB,FLN,POA,CWB,CGR,CGB,CNF,VIX,JPA,PMW,PVH,BVB,RBR,GYN,GRU,CGH"
-        )).replace(" ", "").split(",")
-    ))
-    DESTINOS = [d for d in DESTINOS if d]
-    DESTINOS = list(dict.fromkeys(DESTINOS))
+    # Se DESTINOS não vier, usa capitais
+    _dests = os.getenv("DESTINOS", ",".join(brazil_capitals_iata()))
+    DESTINOS = [x.strip().upper() for x in _dests.split(",") if x.strip()]
+    DESTINOS = [d for d in DESTINOS if d != ORIGEM]
+    DESTINOS = dedupe_keep_order(DESTINOS)
 
     DAYS_AHEAD_FROM = int(os.getenv("DAYS_AHEAD_FROM", "10"))
     DAYS_AHEAD_TO   = int(os.getenv("DAYS_AHEAD_TO", "90"))
     SAMPLE_DEPARTURES = int(os.getenv("SAMPLE_DEPARTURES", "2"))
-    CURRENCY = os.getenv("CURRENCY", "BRL")
-
     MAX_OFFERS = int(os.getenv("MAX_OFFERS", "5"))
-    REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.2"))  # anti rate limit
+    CURRENCY = os.getenv("CURRENCY", "BRL")
+    REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.2"))
 
-# =========================
-# Ambiente / endpoints
-# =========================
-CLIENT_ID = os.getenv("AMADEUS_API_KEY")
-CLIENT_SECRET = os.getenv("AMADEUS_API_SECRET")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-ENV = os.getenv("AMADEUS_ENV", "test").strip().lower()
-BASE_URL = "https://test.api.amadeus.com" if ENV == "test" else "https://api.amadeus.com"
-
-# Regras
+# Alertas
 MAX_PRECO_PP = float(os.getenv("MAX_PRECO_PP", "1200"))
 MIN_DISCOUNT_PCT = float(os.getenv("MIN_DISCOUNT_PCT", "0.25"))
 
-# Histórico CSV
+# Histórico
 HISTORY_PATH = Path(os.getenv("HISTORY_PATH", "data/history.csv"))
 HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-CSV_HEADERS = [
-    "ts_utc", "origem", "destino", "departure_date",
-    "price_total", "currency", "airline", "deeplink",
-    "notified", "reason"
-]
+CSV_HEADERS = ["ts_utc","origem","destino","departure_date","price_total","currency","notified","reason","airline"]
 
-# =========================
+# -----------------------
 # Utils
-# =========================
-def log(msg: str, level: str = "INFO"):
-    icons = {"INFO": "ⓘ", "SUCCESS": "✅", "ERROR": "❌", "WARNING": "⚠️"}
+# -----------------------
+def log(msg, level="INFO"):
+    icons = {"INFO":"ⓘ","SUCCESS":"✅","ERROR":"❌","WARNING":"⚠️"}
     print(f"[{datetime.utcnow().isoformat()}Z] {icons.get(level,' ')} {msg}")
 
-def enviar_telegram(texto: str):
+def enviar_telegram(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram não configurado. Pulando envio.", "WARNING")
+        log("Telegram não configurado (TOKEN/CHAT_ID ausentes).", "WARNING")
         return
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": texto,
-                "disable_web_page_preview": True
-            },
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
             timeout=30,
         )
         r.raise_for_status()
         log("Mensagem enviada ao Telegram.", "SUCCESS")
     except requests.RequestException as e:
-        log(f"Erro ao enviar para Telegram: {e}", "ERROR")
+        log(f"Erro ao enviar Telegram: {e}", "ERROR")
 
-def append_history_row(row: Dict[str, str]):
+def append_history_row(row: dict):
     write_header = not HISTORY_PATH.exists()
     try:
         with HISTORY_PATH.open("a", newline="", encoding="utf-8") as f:
@@ -107,30 +115,11 @@ def append_history_row(row: Dict[str, str]):
                 w.writeheader()
             w.writerow(row)
     except OSError as e:
-        log(f"Erro ao escrever histórico: {e}", "ERROR")
+        log(f"Erro ao gravar histórico: {e}", "ERROR")
 
-def load_best_prices() -> Dict[Tuple[str, str], float]:
-    best: Dict[Tuple[str, str], float] = {}
-    if not HISTORY_PATH.exists():
-        return best
-    try:
-        with HISTORY_PATH.open("r", encoding="utf-8") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                try:
-                    key = (row["origem"], row["destino"])
-                    price = float(row["price_total"])
-                    if key not in best or price < best[key]:
-                        best[key] = price
-                except Exception:
-                    continue
-    except OSError as e:
-        log(f"Erro ao ler histórico: {e}", "WARNING")
-    return best
-
-# =========================
-# Amadeus API
-# =========================
+# -----------------------
+# Amadeus helpers
+# -----------------------
 def get_token() -> str:
     if not CLIENT_ID or not CLIENT_SECRET:
         log("AMADEUS_API_KEY/AMADEUS_API_SECRET ausentes.", "ERROR")
@@ -151,14 +140,14 @@ def get_token() -> str:
         log(f"Falha ao obter token: {e}", "ERROR")
         sys.exit(1)
 
-def buscar_passagens(token: str, origem: str, destino: str, data: str):
+def buscar_passagens(token, origem, destino, date_str):
     params = {
         "originLocationCode": origem,
         "destinationLocationCode": destino,
-        "departureDate": data,
+        "departureDate": date_str,
         "adults": "1",
         "currencyCode": Config.CURRENCY,
-        "max": Config.MAX_OFFERS,
+        "max": str(Config.MAX_OFFERS),
     }
     try:
         r = requests.get(
@@ -170,125 +159,126 @@ def buscar_passagens(token: str, origem: str, destino: str, data: str):
         r.raise_for_status()
         return r.json()
     except requests.RequestException as e:
-        log(f"Erro na busca {origem}->{destino} {data}: {e}", "ERROR")
+        log(f"Erro {origem}->{destino} {date_str}: {e}", "ERROR")
         return None
 
-def find_cheapest_offer(offers):
-    """Retorna a oferta mais barata + 'airline' (operating > marketing) e 'deeplink' básico."""
-    if not offers or "data" not in offers or not offers["data"]:
-        return None
-    try:
-        cheapest = min(offers["data"], key=lambda x: float(x["price"]["total"]))
-    except (KeyError, ValueError, TypeError):
-        return None
-
-    airline = "N/A"
-    try:
-        seg = cheapest["itineraries"][0]["segments"][0]
-        airline = seg.get("operatingCarrierName") or seg.get("marketingCarrierName") or "N/A"
-    except Exception:
-        pass
-    cheapest["airline"] = airline
-
-    cheapest["deeplink"] = ""
-    try:
-        dep_iata = cheapest["itineraries"][0]["segments"][0]["departure"]["iataCode"]
-        arr_iata = cheapest["itineraries"][0]["segments"][-1]["arrival"]["iataCode"]
-        ddate = cheapest["itineraries"][0]["segments"][0]["departure"]["at"][:10]
-        cheapest["deeplink"] = f"https://www.google.com/travel/flights?q=Flights%20{dep_iata}%20to%20{arr_iata}%20{ddate}"
-    except Exception:
-        pass
-
-    return cheapest
-
-# =========================
-# Lógica de alerta
-# =========================
-def deve_alertar(preco_atual: float, melhor_anterior: float | None):
+def extract_airline(offer: dict, dictionaries: dict) -> str:
     """
-    Ordem:
-    1) Queda porcentual (comparada ao melhor preço observado)
-    2) Teto absoluto
+    Tenta obter o nome da cia:
+    1) operatingCarrier / marketingCarrier (IATA) -> dicionário 'carriers'
+    2) cai para o código IATA se nome não existir
     """
-    if melhor_anterior is not None and melhor_anterior not in (0, float("inf")):
-        try:
-            desconto = (melhor_anterior - preco_atual) / melhor_anterior
-        except ZeroDivisionError:
-            desconto = 0.0
-        if desconto >= MIN_DISCOUNT_PCT:
-            return True, f"queda {desconto:.1%}"
+    try:
+        seg0 = offer["itineraries"][0]["segments"][0]
+        op = seg0.get("operating", {}).get("carrierCode") or seg0.get("operatingCarrierCode") \
+             or seg0.get("operatingCarrier")
+        mk = seg0.get("carrierCode") or seg0.get("marketingCarrierCode") \
+             or seg0.get("marketingCarrier")
+        code = op or mk
+        if not code:
+            return "N/A"
+        name = None
+        if dictionaries and "carriers" in dictionaries:
+            name = dictionaries["carriers"].get(code)
+        return name or code
+    except Exception:
+        return "N/A"
 
-    if preco_atual <= MAX_PRECO_PP:
-        return True, f"≤ teto {MAX_PRECO_PP:g}"
+def find_cheapest_offer(payload: dict):
+    if not payload or "data" not in payload or not payload["data"]:
+        return None, None
+    try:
+        cheapest = min(
+            payload["data"],
+            key=lambda x: float(x.get("price", {}).get("total", float("inf")))
+        )
+        dictionaries = payload.get("dictionaries", {})
+        return cheapest, dictionaries
+    except Exception as e:
+        log(f"Erro ao escolher mais barata: {e}", "ERROR")
+        return None, None
 
-    return False, "sem queda / acima do teto"
-
-# =========================
-# Datas & processamento
-# =========================
+# -----------------------
+# Lógica & datas
+# -----------------------
 def gerar_datas():
-    base = datetime.utcnow().date()
-    datas = set()
-    while len(datas) < Config.SAMPLE_DEPARTURES:
+    today = datetime.utcnow().date()
+    out = []
+    for _ in range(Config.SAMPLE_DEPARTURES):
         delta = random.randint(Config.DAYS_AHEAD_FROM, Config.DAYS_AHEAD_TO)
-        datas.add((base + timedelta(days=delta)).strftime("%Y-%m-%d"))
-    return sorted(datas)
+        out.append((today + timedelta(days=delta)).strftime("%Y-%m-%d"))
+    return out
 
-def process_destination(token: str, origem: str, destino: str, melhores_precos: Dict[Tuple[str, str], float]):
-    log(f"🔍 {origem} → {destino}")
-    key = (origem, destino)
-    best = melhores_precos.get(key, float("inf"))
+def deve_alertar(preco_atual: float, melhor_anterior: float | None):
+    # 1) teto absoluto
+    if preco_atual <= MAX_PRECO_PP:
+        return True, f"≤ teto {int(MAX_PRECO_PP) if MAX_PRECO_PP.is_integer() else MAX_PRECO_PP}"
+    # 2) queda percentual relevante
+    if melhor_anterior is not None and melhor_anterior not in (0, float("inf")):
+        queda = (melhor_anterior - preco_atual) / melhor_anterior
+        if queda >= MIN_DISCOUNT_PCT:
+            return True, f"queda {queda:.0%}"
+    return False, "sem queda suficiente"
 
-    for data in gerar_datas():
+def resumo_msg(origem, destino, date_str, price, currency, airline, motivo):
+    price_fmt = f"{price:.2f}"
+    return f"✈️ {origem} → {destino} em {date_str}: {price_fmt} {currency} ({airline}) — {motivo}"
+
+def process_destino(token, origem, destino, melhores: dict):
+    log(f"🔎 {origem} → {destino}")
+    best_key = (origem, destino)
+    melhor_anterior = melhores.get(best_key, float("inf"))
+
+    for date_str in gerar_datas():
         time.sleep(Config.REQUEST_DELAY)
-        offers = buscar_passagens(token, origem, destino, data)
-        if not offers:
+        payload = buscar_passagens(token, origem, destino, date_str)
+        if not payload:
             continue
-        cheapest = find_cheapest_offer(offers)
+
+        cheapest, dictionaries = find_cheapest_offer(payload)
         if not cheapest:
             continue
 
-        preco = float(cheapest["price"]["total"])
-        moeda = cheapest["price"]["currency"]
-        cia = cheapest.get("airline", "N/A")
-        link = cheapest.get("deeplink", "")
+        price = float(cheapest["price"]["total"])
+        currency = cheapest["price"].get("currency", Config.CURRENCY)
+        airline = extract_airline(cheapest, dictionaries)
 
-        alert, motivo = deve_alertar(preco, best)
+        # Tentativa segura da data real do voo
+        try:
+            date_real = cheapest["itineraries"][0]["segments"][0]["departure"]["at"][:10]
+        except Exception:
+            date_real = date_str
+
+        alert, motivo = deve_alertar(price, melhor_anterior)
+        notified = False
         if alert:
-            msg = f"✈️ {origem} → {destino} em {data}: {preco:.2f} {moeda} ({cia}) - {motivo}."
-            if link:
-                msg += f"\n{link}"
-            enviar_telegram(msg)
+            enviar_telegram(resumo_msg(origem, destino, date_real, price, currency, airline, motivo))
+            notified = True
 
         append_history_row({
-            "ts_utc": datetime.utcnow().isoformat() + "Z",
+            "ts_utc": datetime.utcnow().isoformat()+"Z",
             "origem": origem,
             "destino": destino,
-            "departure_date": data,
-            "price_total": f"{preco:.2f}",
-            "currency": moeda,
-            "airline": cia,
-            "deeplink": link,
-            "notified": "1" if alert else "0",
+            "departure_date": date_real,
+            "price_total": f"{price:.2f}",
+            "currency": currency,
+            "notified": "1" if notified else "0",
             "reason": motivo,
+            "airline": airline,
         })
 
-        if preco < best:
-            best = preco
-            melhores_precos[key] = best
+        if price < melhor_anterior:
+            melhor_anterior = price
+            melhores[best_key] = price
 
 def main():
-    ambiente = "🚀 PRODUÇÃO" if ENV != "test" else "🔧 SANDBOX"
-    log(f"Iniciando monitor | ENV={ENV} ({ambiente}) | BASE={BASE_URL}")
+    banner_env = "🚀 PRODUÇÃO" if ENV == "production" else "🔧 SANDBOX"
+    log(f"Iniciando monitor | ENV={ENV} ({banner_env}) | BASE={BASE_URL}")
     token = get_token()
-    log("Token obtido com sucesso.", "SUCCESS")
-
-    melhores = load_best_prices()
-
-    for destino in Config.DESTINOS:
-        process_destination(token, Config.ORIGEM, destino, melhores)
-
-    log("Execução finalizada.", "SUCCESS")
+    melhores = {}
+    for dest in Config.DESTINOS:
+        process_destino(token, Config.ORIGEM, dest, melhores)
+    log("Monitoramento concluído.", "SUCCESS")
 
 if __name__ == "__main__":
     main()
