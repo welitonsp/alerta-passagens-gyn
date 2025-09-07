@@ -27,3 +27,4 @@ def test_get_token_ok(monkeypatch):
 
     token = m.get_token()
     assert token == "abc123"
+    
