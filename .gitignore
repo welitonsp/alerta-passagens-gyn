@@ -1,17 +1,16 @@
 # Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
+
+# venv
 .venv/
+env/
 venv/
-.env
 
-# Data
-data/*.tmp
-# mantenha o histórico versionado se quiser acompanhar no git:
-# !data/history.csv
+# data
+data/*.csv
+!data/history.csv  # mantém o histórico versionado
 
-# IDEs
-.vscode/
-.idea/
+# OS
+.DS_Store
+Thumbs.db
