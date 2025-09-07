@@ -2,16 +2,17 @@ name: Monitoramento de Passagens (Amadeus)
 
 on:
   schedule:
-    - cron: "0 */4 * * *"   # executa a cada 4h (UTC)
+    - cron: "0 */4 * * *"     # a cada 4h (UTC)
   workflow_dispatch:
+
+permissions:
+  contents: write             # para comitar data/history.csv
 
 jobs:
   monitor-passagens:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    concurrency:
-      group: monitor-passagens
-      cancel-in-progress: true
+    timeout-minutes: 20
+    concurrency: monitor-passagens
 
     steps:
       - name: Checkout
@@ -27,31 +28,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Diagnóstico secrets e arquivos
+      - name: Run monitor (Amadeus) - PRODUÇÃO
         env:
-          AMADEUS_API_KEY:    ${{ secrets.AMADEUS_API_KEY }}
-          AMADEUS_API_SECRET: ${{ secrets.AMADEUS_API_SECRET }}
-        run: |
-          echo "AMADEUS_API_KEY: $([ -n "$AMADEUS_API_KEY" ] && echo OK || echo MISSING)"
-          echo "AMADEUS_API_SECRET: $([ -n "$AMADEUS_API_SECRET" ] && echo OK || echo MISSING)"
-          echo "Arquivos na raiz:"; ls -la
-
-      - name: Teste OAuth Amadeus (isolado)
-        env:
-          AMADEUS_API_KEY:    ${{ secrets.AMADEUS_API_KEY }}
-          AMADEUS_API_SECRET: ${{ secrets.AMADEUS_API_SECRET }}
-          AMADEUS_ENV: sandbox
-          AMADEUS_BASE_URL: https://test.api.amadeus.com
-        run: |
-          python check_amadeus_api.py
-
-      - name: Run monitor (Amadeus)
-        env:
-          AMADEUS_API_KEY:    ${{ secrets.AMADEUS_API_KEY }}
-          AMADEUS_API_SECRET: ${{ secrets.AMADEUS_API_SECRET }}
+          # --- secrets obrigatórios ---
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          AMADEUS_ENV: sandbox                   # troque para 'production' se suas chaves forem de produção
-          AMADEUS_BASE_URL: https://test.api.amadeus.com
+          AMADEUS_API_KEY:    ${{ secrets.AMADEUS_API_KEY }}
+          AMADEUS_API_SECRET: ${{ secrets.AMADEUS_API_SECRET }}
+
+          # --- ambiente produção ---
+          AMADEUS_ENV:        production
+
+          # --- parâmetros de busca ---
+          ORIGEM: GYN
+          # TODAS as capitais (ver nota abaixo). Você pode reduzir e expandir depois:
+          DESTINOS: GIG,SDU,SSA,FOR,REC,NAT,MCZ,AJU,MAO,BEL,SLZ,THE,BSB,FLN,POA,CWB,CGR,CGB,CNF,VIX,JPA,PMW,PVH,BVB,RBR,GYN,GRU,CGH
+          CURRENCY: BRL
+
+          # --- ajuste de volume para começar suave ---
+          SAMPLE_DEPARTURES: "2"
+          MAX_OFFERS: "5"
+          REQUEST_DELAY: "1.2"
+
+          # Regras de alerta
+          MAX_PRECO_PP: "1200"
+          MIN_DISCOUNT_PCT: "0.25"
+
+          # Histórico
+          HISTORY_PATH: data/history.csv
         run: |
-          python monitor_passagens.py --debug
+          python monitor_passagens.py
+
+      - name: Commit histórico (se mudou)
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(monitor): atualizar histórico de preços"
+          file_pattern: data/history.csv
