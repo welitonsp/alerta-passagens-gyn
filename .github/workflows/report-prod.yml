@@ -1,0 +1,42 @@
+name: Relatório Diário (PROD)
+
+on:
+  schedule:
+    - cron: "0 12 * * *"   # 12:00 UTC (~09:00 America/Sao_Paulo)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Gerar e enviar relatório (produção)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          ORIGEM: GYN
+          REPORT_ONLY_YESTERDAY: "true"         # ontem
+          REPORT_USE_BRAZIL_LOCAL_DAY: "false"  # true = ontem no horário BR
+          REPORT_COMPARE: "true"                # compara com período anterior
+          REPORT_COMPARE_WINDOW_DAYS: "1"       # anteontem
+          REPORT_TOP_K: "15"
+          REPORT_TITLE: "📊 Relatório diário — menores preços (PROD)"
+          REPORT_PARSE_MODE: "MarkdownV2"       # "", "Markdown", "MarkdownV2"
+          REPORT_INCLUDE_LINKS: "true"
+        run: python gerar_relatorio.py
