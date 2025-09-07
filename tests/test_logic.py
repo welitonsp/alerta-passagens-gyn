@@ -1,9 +1,8 @@
 import monitor_passagens as m
 
 def test_deve_alertar_por_queda_percentual():
-    # força teto baixo para garantir priorização de 'queda'
     m.MAX_PRECO_PP = 10.0
-    m.MIN_DISCOUNT_PCT = 0.20  # 20%
+    m.MIN_DISCOUNT_PCT = 0.20
     ok, motivo = m.deve_alertar(preco_atual=70.0, melhor_anterior=100.0)
     assert ok is True
     assert "queda" in motivo or "%" in motivo
