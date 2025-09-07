@@ -1,16 +1,13 @@
 # Python
 __pycache__/
 *.pyc
-
-# venv
 .venv/
-env/
 venv/
+.env
 
-# data
+# Data
 data/*.csv
-!data/history.csv  # mantém o histórico versionado
+!data/.keep
 
-# OS
-.DS_Store
-Thumbs.db
+# pytest
+.pytest_cache/
