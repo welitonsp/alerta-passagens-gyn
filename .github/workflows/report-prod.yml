@@ -1,10 +1,9 @@
-name: Relatório Diário de Preços
+name: Relatório Diário de Prêmios
 
 on:
   schedule:
-    # Roda todo dia às 12:00 UTC (≈ 09:00 em São Paulo)
-    - cron: "0 12 * * *"
-  workflow_dispatch: {}
+    - cron: "0 12 * * *"   # 12:00 UTC
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,34 +11,18 @@ permissions:
 jobs:
   report:
     runs-on: ubuntu-latest
-    concurrency: report-diario           # evita duas execuções simultâneas
-    timeout-minutes: 10
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Instalar dependências
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
       - name: Gerar e enviar relatório
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           HISTORY_PATH:       data/history.csv
-          # opcional: TG_PARSE_MODE=HTML (default do script já é HTML)
-        run: |
-          python gerar_relatorio.py
+        run: python gerar_relatorio.py
