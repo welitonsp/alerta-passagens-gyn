@@ -6,10 +6,10 @@ Monitoramento de Passagens Aéreas (Amadeus + Telegram)
 
 - Origem fixa: GYN
 - Destinos: capitais do Brasil (pode sobrescrever via DESTINOS)
-- Busca ida+volta (menores ida e volta, companhias podem ser diferentes)
+- Busca ida+volta (ida e volta podem ser de companhias diferentes)
 - Envia alertas no Telegram e registra histórico CSV
 - Melhorias: sessão HTTP com Retry/Backoff, validação robusta, User-Agent,
-  concorrência opcional para buscas de volta.
+  concorrência opcional para buscas de volta, REQUEST_TIMEOUT e LOG_LEVEL.
 """
 
 from __future__ import annotations
@@ -29,7 +29,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ============== Log ==============
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+_LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "SUCCESS": 21, "WARNING": 30, "ERROR": 40}
+_THRESHOLD = _LEVEL_ORDER.get(_LOG_LEVEL, 20)
+
 def log(msg: str, level: str = "INFO") -> None:
+    lvl = _LEVEL_ORDER.get(level.upper(), 20)
+    if lvl < _THRESHOLD:
+        return
     icons = {"INFO": "ⓘ", "SUCCESS": "✅", "ERROR": "❌", "WARNING": "⚠️", "DEBUG": "🔎"}
     print(f"[{datetime.utcnow().isoformat()}Z] {icons.get(level, ' ')} {msg}")
 
@@ -65,6 +72,7 @@ STAY_NIGHTS_MAX   = int(os.getenv("STAY_NIGHTS_MAX", "10"))
 
 MAX_OFFERS    = int(os.getenv("MAX_OFFERS", "5"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.2"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30"))
 
 # Regras (testes mexem nessas variáveis em runtime)
 MAX_PRECO_PP     = float(os.getenv("MAX_PRECO_PP", "1200"))
@@ -144,7 +152,7 @@ def get_token() -> str:
         resp = SESSION.post(
             f"{BASE_URL}/v1/security/oauth2/token",
             data={"grant_type":"client_credentials","client_id":CLIENT_ID,"client_secret":CLIENT_SECRET},
-            timeout=30,
+            timeout=REQUEST_TIMEOUT,
         )
         if resp.status_code != 200:
             log(f"Falha ao obter token: {resp.status_code} {resp.text[:200]}", "ERROR")
@@ -216,7 +224,7 @@ def buscar_one_way(token: str, origem: str, destino: str, date_yyyy_mm_dd: str) 
     try:
         r = SESSION.get(
             f"{BASE_URL}/v2/shopping/flight-offers",
-            headers=headers, params=params, timeout=60,
+            headers=headers, params=params, timeout=REQUEST_TIMEOUT,
         )
         # Tratamento básico de rate limit: se 429, aumenta pausa temporária
         if r.status_code == 429:
@@ -244,7 +252,7 @@ def tg_send(text: str, preview: bool = False) -> None:
                 "parse_mode": TG_PARSE_MODE,
                 "disable_web_page_preview": (not preview),
             },
-            timeout=30,
+            timeout=REQUEST_TIMEOUT,
         )
         if r.status_code != 200:
             log(f"Telegram HTTP {r.status_code}: {r.text[:200]}", "ERROR")
@@ -360,7 +368,7 @@ def process_destino_roundtrip(token: str, origem: str, destino: str, best_totals
                     d_volta = futs[fut]
                     cheapest_in = fut.result()
                     results.append((d_volta, cheapest_in))
-                    time.sleep(REQUEST_DELAY)  # ainda respeita um delay básico
+                    time.sleep(REQUEST_DELAY)  # respeita um delay básico
         else:
             for d_volta in retornos:
                 time.sleep(REQUEST_DELAY)
