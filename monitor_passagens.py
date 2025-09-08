@@ -1,7 +1,18 @@
+# --- imports devem vir ANTES de usar qualquer módulo ---
+import os
+import sys
+import time
+import csv
+import random
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional
+import requests
+
 # -----------------------
-# Config
+# helpers de lista
 # -----------------------
-def brazil_capitals_iata():
+def brazil_capitals_iata() -> List[str]:
     return [
         "GIG","SDU","SSA","FOR","REC","NAT","MCZ","AJU",
         "MAO","BEL","SLZ","THE","BSB","FLN","POA","CWB",
@@ -9,18 +20,21 @@ def brazil_capitals_iata():
         "RBR","GYN","GRU","CGH"
     ]
 
-def dedupe_keep_order(seq):
+def dedupe_keep_order(seq: List[str]) -> List[str]:
     seen = set(); out = []
     for x in seq:
         if x and x not in seen:
             seen.add(x); out.append(x)
     return out
 
+# -----------------------
+# Config
+# -----------------------
 class Config:
     ORIGEM = os.getenv("ORIGEM", "GYN").strip().upper()
 
     _dests_str = os.getenv("DESTINOS", ",".join(brazil_capitals_iata()))
-    # apenas normaliza aqui; NÃO filtre por ORIGEM dentro da classe
+    # normaliza apenas; NÃO use ORIGEM aqui dentro
     DESTINOS = [x.strip().upper() for x in _dests_str.split(",") if x.strip()]
 
     DAYS_AHEAD_FROM = int(os.getenv("DAYS_AHEAD_FROM", "10"))
@@ -30,5 +44,5 @@ class Config:
     CURRENCY = os.getenv("CURRENCY", "BRL")
     REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.2"))
 
-# >>> pós-processamento fora da classe (agora pode usar Config.ORIGEM)
+# pós-processamento (agora pode referenciar Config.ORIGEM)
 Config.DESTINOS = dedupe_keep_order([d for d in Config.DESTINOS if d != Config.ORIGEM])
