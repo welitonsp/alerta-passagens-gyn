@@ -4,10 +4,12 @@
 """
 Monitoramento de Passagens Aéreas (Amadeus + Telegram)
 
-- Origem fixa: GYN (Goiânia)
-- Destinos padrão: capitais do Brasil (pode sobrescrever via env DESTINOS)
-- Busca ida+volta (menor ida + menor volta, companhias podem ser diferentes)
-- Envia alertas no Telegram, com link do Google Flights e registra histórico em CSV
+- Origem fixa: GYN
+- Destinos: capitais do Brasil (pode sobrescrever via DESTINOS)
+- Busca ida+volta (menores ida e volta, companhias podem ser diferentes)
+- Envia alertas no Telegram e registra histórico CSV
+- Melhorias: sessão HTTP com Retry/Backoff, validação robusta, User-Agent,
+  concorrência opcional para buscas de volta.
 """
 
 from __future__ import annotations
@@ -20,8 +22,11 @@ import random
 from typing import Optional, Tuple, Dict, Any, List
 from datetime import datetime, timedelta
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ============== Log ==============
 def log(msg: str, level: str = "INFO") -> None:
@@ -94,18 +99,56 @@ AIRLINE_CODE_TO_NAME = {
     "2Z": "Azul Conecta",
 }
 
+# HTTP/Retry tuning
+MAX_RETRIES     = int(os.getenv("MAX_RETRIES", "3"))
+BACKOFF_FACTOR  = float(os.getenv("BACKOFF_FACTOR", "0.6"))
+RETRY_STATUSES  = (429, 500, 502, 503, 504)
+USER_AGENT      = os.getenv("USER_AGENT", "FlightMonitor/1.0 (+github actions)")
+
+# Concorrência opcional (apenas nas buscas de volta)
+CONCURRENCY = max(1, int(os.getenv("CONCURRENCY", "1")))  # 1 = desativado
+
+# ============== HTTP Session com Retry ==============
+def _build_session() -> requests.Session:
+    sess = requests.Session()
+    retry = Retry(
+        total=MAX_RETRIES,
+        read=MAX_RETRIES,
+        connect=MAX_RETRIES,
+        backoff_factor=BACKOFF_FACTOR,
+        status_forcelist=RETRY_STATUSES,
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    sess.headers.update({"User-Agent": USER_AGENT})
+    return sess
+
+SESSION = _build_session()
+
+# ============== Util ==============
+def _safe_float(value: Any, default: float = float("inf")) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
 # ============== Funções exigidas pelos testes ==============
 def get_token() -> str:
     if not CLIENT_ID or not CLIENT_SECRET:
         log("AMADEUS_API_KEY/AMADEUS_API_SECRET ausentes.", "ERROR")
         sys.exit(1)
     try:
-        resp = requests.post(
+        resp = SESSION.post(
             f"{BASE_URL}/v1/security/oauth2/token",
             data={"grant_type":"client_credentials","client_id":CLIENT_ID,"client_secret":CLIENT_SECRET},
             timeout=30,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            log(f"Falha ao obter token: {resp.status_code} {resp.text[:200]}", "ERROR")
+            sys.exit(1)
         return resp.json()["access_token"]
     except requests.RequestException as e:
         log(f"Falha ao obter token: {e}", "ERROR")
@@ -152,9 +195,9 @@ def _cheapest(offers_json: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
     try:
         cheapest = min(
             offers_json["data"],
-            key=lambda x: float(x.get("price", {}).get("total", float("inf")))
+            key=lambda x: _safe_float(x.get("price", {}).get("total"))
         )
-    except (TypeError, ValueError):
+    except Exception:
         return None
     cheapest = dict(cheapest)
     cheapest["airline"] = _extract_airline_name(cheapest)
@@ -169,31 +212,31 @@ def buscar_one_way(token: str, origem: str, destino: str, date_yyyy_mm_dd: str) 
         "currencyCode": CURRENCY,
         "max": str(MAX_OFFERS),
     }
+    headers = {"Authorization": f"Bearer {token}"}
     try:
-        r = requests.get(
+        r = SESSION.get(
             f"{BASE_URL}/v2/shopping/flight-offers",
-            headers={"Authorization": f"Bearer {token}"},
-            params=params,
-            timeout=60,
+            headers=headers, params=params, timeout=60,
         )
+        # Tratamento básico de rate limit: se 429, aumenta pausa temporária
+        if r.status_code == 429:
+            log("429 recebido. Aumentando delay temporariamente.", "WARNING")
+            time.sleep(max(3.0, REQUEST_DELAY * 2))
         if r.status_code != 200:
             log(f"Amadeus {origem}->{destino} {date_yyyy_mm_dd} HTTP {r.status_code}: {r.text[:300]}", "WARNING")
             return None
         return r.json()
     except requests.RequestException as e:
-        log(f"Erro HTTP one-way {origem}->{destino} {date_yyyy_mm_dd}: {e}", "ERROR")
+        log(f"Erro HTTP {origem}->{destino} {date_yyyy_mm_dd}: {e}", "ERROR")
         return None
 
 # ============== Telegram ==============
 def tg_send(text: str, preview: bool = False) -> None:
-    """
-    preview=True => permite cartão/preview do link.
-    """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log("Telegram não configurado. Pulando envio.", "WARNING")
         return
     try:
-        r = requests.post(
+        r = SESSION.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
@@ -211,8 +254,6 @@ def tg_send(text: str, preview: bool = False) -> None:
         log(f"Erro ao enviar Telegram: {e}", "ERROR")
 
 # ============== Histórico CSV ==============
-HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-
 def _append_history_row(row: Dict[str, Any]) -> None:
     write_header = not HISTORY_PATH.exists()
     try:
@@ -261,22 +302,20 @@ def _datas_ida() -> List[str]:
 def _datas_retorno_para(ida: str) -> List[str]:
     d0 = datetime.strptime(ida, "%Y-%m-%d").date()
     ret: List[str] = []
-    for n in range(min(STAY_NIGHTS_MIN, STAY_NIGHTS_MAX), max(STAY_NIGHTS_MIN, STAY_NIGHTS_MAX) + 1):
+    a, b = sorted((STAY_NIGHTS_MIN, STAY_NIGHTS_MAX))
+    for n in range(a, b + 1):
         ret.append((d0 + timedelta(days=n)).strftime("%Y-%m-%d"))
     return ret
 
 # ============== Google Flights deeplink ==============
 def google_flights_deeplink(orig: str, dest: str, ida: str, volta: str) -> str:
-    """
-    Usa o formato #flt=ORIG.DEST.YYYY-MM-DD*DEST.ORIG.YYYY-MM-DD para abrir
-    direto a rota no Google Flights, com BRL.
-    """
     return f"https://www.google.com/travel/flights#flt={orig}.{dest}.{ida}*{dest}.{orig}.{volta};c:{CURRENCY};e:1;sd:1;t:e"
 
-# ============== Lógica principal (ida+volta) ==============
+# ============== Score (placeholder) ==============
 def _score(preco_total: float, preco_out: float, preco_in: float) -> float:
     return 0.0
 
+# ============== Formatação ==============
 def _format_msg(origem: str, destino: str, d_ida: str, d_volta: str,
                 preco_total: float, moeda: str,
                 out_price: float, in_price: float,
@@ -289,6 +328,11 @@ def _format_msg(origem: str, destino: str, d_ida: str, d_volta: str,
         f"• <b>Total:</b> {preco_total:.2f} {moeda} — {motivo}"
     )
 
+# ============== Processamento (ida+volta) ==============
+def _cheapest_for(token: str, o: str, d: str, date: str) -> Optional[Dict[str, Any]]:
+    js = buscar_one_way(token, o, d, date)
+    return _cheapest(js)
+
 def process_destino_roundtrip(token: str, origem: str, destino: str, best_totals: Dict[Tuple[str, str], float]) -> None:
     log(f"🔍 {origem} → {destino} (ida+volta)")
 
@@ -297,24 +341,39 @@ def process_destino_roundtrip(token: str, origem: str, destino: str, best_totals
 
     for d_ida in _datas_ida():
         time.sleep(REQUEST_DELAY)
-        js_out = buscar_one_way(token, origem, destino, d_ida)
-        cheapest_out = _cheapest(js_out)
+        cheapest_out = _cheapest_for(token, origem, destino, d_ida)
         if not cheapest_out:
             continue
-        preco_out = float(cheapest_out["price"]["total"])
-        moeda = cheapest_out["price"]["currency"]
-        out_air = cheapest_out.get("airline", "N/A")
 
-        for d_volta in _datas_retorno_para(d_ida):
-            time.sleep(REQUEST_DELAY)
-            js_in = buscar_one_way(token, destino, origem, d_volta)
-            cheapest_in = _cheapest(js_in)
+        preco_out = _safe_float(cheapest_out.get("price", {}).get("total"))
+        moeda     = cheapest_out.get("price", {}).get("currency", CURRENCY)
+        out_air   = cheapest_out.get("airline", "N/A")
+
+        # Retornos – opção de concorrência limitada
+        retornos = _datas_retorno_para(d_ida)
+        results = []
+
+        if CONCURRENCY > 1 and len(retornos) > 1:
+            with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
+                futs = {ex.submit(_cheapest_for, token, destino, origem, d): d for d in retornos}
+                for fut in as_completed(futs):
+                    d_volta = futs[fut]
+                    cheapest_in = fut.result()
+                    results.append((d_volta, cheapest_in))
+                    time.sleep(REQUEST_DELAY)  # ainda respeita um delay básico
+        else:
+            for d_volta in retornos:
+                time.sleep(REQUEST_DELAY)
+                cheapest_in = _cheapest_for(token, destino, origem, d_volta)
+                results.append((d_volta, cheapest_in))
+
+        for d_volta, cheapest_in in results:
             if not cheapest_in:
                 continue
-            preco_in = float(cheapest_in["price"]["total"])
-            in_air = cheapest_in.get("airline", "N/A")
+            preco_in = _safe_float(cheapest_in.get("price", {}).get("total"))
+            in_air   = cheapest_in.get("airline", "N/A")
+            total    = preco_out + preco_in
 
-            total = preco_out + preco_in
             if (melhor_combo is None) or (total < melhor_combo[0]):
                 melhor_combo = (total, moeda, d_ida, d_volta, preco_out, preco_in, out_air, in_air)
 
@@ -342,7 +401,6 @@ def process_destino_roundtrip(token: str, origem: str, destino: str, best_totals
             preco_out, preco_in, out_air, in_air, motivo, score
         )
         tg_send(msg)  # sem preview
-        # Envia o link com preview ativado (cartão do Telegram)
         link = google_flights_deeplink(origem, destino, d_ida, d_volta)
         tg_send(f"🔎 Ver no Google Flights\n{link}", preview=True)
         notified = True
@@ -356,7 +414,7 @@ def process_destino_roundtrip(token: str, origem: str, destino: str, best_totals
         "price_outbound": f"{preco_out:.2f}", "price_inbound": f"{preco_in:.2f}",
         "airline_outbound": out_air, "airline_inbound": in_air,
         "notified": "1" if notified else "0",
-        "reason": motivo, "score": f"{int(score)}",
+        "reason": motivo, "score": "0",
     })
 
     if total < melhor_global:
