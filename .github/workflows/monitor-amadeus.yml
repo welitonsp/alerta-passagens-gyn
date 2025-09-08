@@ -1,68 +1,96 @@
-name: Monitoramento de Passagens (Amadeus - SANDBOX)
+name: Monitoramento de Passagens (Amadeus Sandbox)
 
 on:
   schedule:
-    - cron: "0 */4 * * *"   # a cada 4 horas (UTC)
-  workflow_dispatch:
+    # roda a cada 4 horas (UTC). Ex.: 00:00, 04:00, 08:00, ...
+    - cron: "0 */4 * * *"
+  workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: write  # necessário para comitar data/history.csv quando houver mudanças
 
 jobs:
   monitor-passagens:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    concurrency: monitor-passagens
+    concurrency: monitor-amadeus            # evita execuções concorrentes
+    timeout-minutes: 20
+
+    env:
+      # ===== Ajustes padrão do monitor =====
+      ORIGEM: GYN
+      DESTINOS: >-
+        GIG,SDU,SSA,FOR,REC,NAT,MCZ,AJU,MAO,BEL,SLZ,THE,BSB,FLN,POA,CWB,
+        CGR,CGB,CNF,VIX,JPA,PMW,PVH,BVB,RBR,GYN,GRU,CGH
+      CURRENCY: BRL
+      SAMPLE_DEPARTURES: "2"      # quantas datas-alvo por destino
+      MAX_OFFERS: "5"             # máximo de ofertas por consulta
+      REQUEST_DELAY: "1.2"        # atraso entre chamadas à API (segundos)
+
+      # Regras de alerta básicas (o script também usa Deal Score)
+      MAX_PRECO_PP: "1200"        # teto absoluto para alertar
+      MIN_DISCOUNT_PCT: "0.25"    # alerta se queda >= 25% versus melhor prévio
+
+      # SANDBOX por padrão (NÃO usar production sem credenciais pagas)
+      AMADEUS_ENV: sandbox
+
+      # Recursos avançados do monitor:
+      CALENDAR_SWEEP_DAYS: "1"    # varrer ±1 dia quando promissor
+      SCORE_ALERT_MIN: "20"       # alerta se score >= 20
+      SCORE_SWEEP_MIN: "10"       # faz sweep se score >= 10
+      COOLDOWN_HOURS: "12"        # evita spam de mesma rota por X horas
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Debug env (AMADEUS)
-        run: |
-          echo "== ENV CHECK ==" 
-          env | sort | grep -E 'AMADEUS|ALLOW_PROD|ORIGEM|DESTINOS' || true
-
-      - name: Ping Telegram (teste)
+      # Opcional, mas útil: confirma que o bot de Telegram está alcançável
+      - name: Ping Telegram (opcional)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python - <<'PY'
-          import os,requests,sys
+          import os, requests, sys
           t=os.getenv("TELEGRAM_BOT_TOKEN"); c=os.getenv("TELEGRAM_CHAT_ID")
-          if not t or not c: sys.exit(0)
+          if not t or not c:
+              print("Telegram não configurado. Pulando ping.")
+              sys.exit(0)
           r=requests.post(f"https://api.telegram.org/bot{t}/sendMessage",
-                          json={"chat_id":c,"text":"✅ Conectado ao Telegram."},timeout=20)
-          print("HTTP", r.status_code); r.raise_for_status()
+                          json={"chat_id": c,
+                                "text": "✅ Monitor iniciado — SANDBOX"},
+                          timeout=20)
+          print("HTTP", r.status_code, r.text[:200])
+          r.raise_for_status()
           PY
 
-      - name: Run monitor (Amadeus)
+      - name: Run monitor (Amadeus Sandbox)
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Credenciais e Telegram (NÃO exponha em logs)
           AMADEUS_API_KEY:    ${{ secrets.AMADEUS_API_KEY }}
           AMADEUS_API_SECRET: ${{ secrets.AMADEUS_API_SECRET }}
-          AMADEUS_ENV: sandbox     # força SANDBOX
-          ALLOW_PROD: "0"          # trava produção
-          ORIGEM: GYN
-          DESTINOS: GIG,SDU,SSA,FOR,REC,NAT,MCZ,AJU,MAO,BEL,SLZ,THE,BSB,FLN,POA,CWB,CGR,CGB,CNF,VIX,JPA,PMW,PVH,BVB,RBR,GYN,GRU,CGH
-          CURRENCY: BRL
-          SAMPLE_DEPARTURES: "2"
-          MAX_OFFERS: "5"
-          REQUEST_DELAY: "1.2"
-          MAX_PRECO_PP: "1200"
-          MIN_DISCOUNT_PCT: "0.25"
-          HISTORY_PATH: data/history.csv
-        run: python monitor_passagens.py
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          # As demais variáveis já estão no bloco `env:` do job
+        run: |
+          python monitor_passagens.py
 
       - name: Commit histórico (se mudou)
         uses: stefanzweifel/git-auto-commit-action@v5
