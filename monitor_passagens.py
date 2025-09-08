@@ -2,450 +2,444 @@
 # -*- coding: utf-8 -*-
 
 """
-Monitoramento de Passagens (Amadeus + Telegram)
-
-• IDA + VOLTA: escolhe a ida mais barata (origem→destino) e a volta mais barata
-  (destino→origem) para a data de retorno. Companhias podem ser diferentes.
-• Cache de token com renovação automática.
-• Retries com backoff exponencial para chamadas HTTP (429/5xx).
-• Logs estruturados (LOG_LEVEL).
-
-Requer segredos no GitHub Actions:
-- AMADEUS_API_KEY
-- AMADEUS_API_SECRET
-- TELEGRAM_BOT_TOKEN
-- TELEGRAM_CHAT_ID
+Monitoramento de Passagens Aéreas (Amadeus Sandbox + Telegram)
+- Origem fixa: GYN (Goiânia)
+- Destinos: configuráveis via env (por padrão todas capitais/hubs principais)
+- Busca ida+volta com companhias possivelmente diferentes em cada perna
+- Seleciona a combinação mais barata (ida + volta)
+- Envia alerta no Telegram conforme regras
+- Registra histórico em CSV
 """
 
-from __future__ import annotations
 import os
 import sys
-import json
 import csv
+import json
 import time
 import random
-import logging
-from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, Tuple, List
-
 import requests
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, Tuple, Optional, List, Any
 
+# ---------------------------
+# Config primária (fora da classe) — evita NameError em compreensões dentro de classe
+# ---------------------------
 
-# =========================
-# Logging
-# =========================
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)sZ [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
+# Origem fixa em Goiânia:
+ORIGEM_ENV = "GYN"  # força Goiânia como origem
+
+# Lista prática (capitais + hubs relevantes no mesmo mercado)
+DEFAULT_CAPITAIS = (
+    "RBR,MAO,MCP,BEL,PVH,BVB,PMW,MCZ,SSA,FOR,SLZ,JPA,REC,THE,NAT,AJU,BSB,"
+    "CGB,CGR,VIX,CNF,SDU,GIG,CGH,GRU,CWB,POA,FLN"
 )
-# Força UTC no formatter visual
-logging.Formatter.converter = time.gmtime
-log = logging.getLogger("monitor")
 
+_destinos_raw = os.getenv("DESTINOS", DEFAULT_CAPITAIS)
+_destinos_list = [d.strip().upper() for d in _destinos_raw.split(",") if d.strip()]
+# dedupe preservando ordem e removendo a origem
+DESTINOS_ENV = [d for d in dict.fromkeys(_destinos_list) if d != ORIGEM_ENV]
 
-# =========================
-# Config via variáveis
-# =========================
+# ---------------------------
+# Classe de configuração (consome os valores já calculados acima)
+# ---------------------------
 class Config:
-    ORIGEM = os.getenv("ORIGEM", "GYN").strip().upper()
+    ORIGEM = ORIGEM_ENV
+    DESTINOS = DESTINOS_ENV
 
-    # capitais brasileiras (sem repetir a origem)
-    _capitais = "GIG,SDU,SSA,FOR,REC,NAT,MCZ,AJU,MAO,BEL,SLZ,THE,BSB,FLN,POA,CWB,CGR,CGB,CNF,VIX,JPA,PMW,PVH,BVB,RBR,GYN,GRU,CGH"
-    DESTINOS = [d for d in dict.fromkeys(os.getenv("DESTINOS", _capitais).split(",")) if d and d.strip().upper() != ORIGEM]
-
-    CURRENCY = os.getenv("CURRENCY", "BRL").strip().upper()
-
-    # janelas / amostragem
+    # datas (amostragem)
     DAYS_AHEAD_FROM = int(os.getenv("DAYS_AHEAD_FROM", "10"))
-    DAYS_AHEAD_TO   = int(os.getenv("DAYS_AHEAD_TO",   "90"))
-    SAMPLE_DEPARTURES = int(os.getenv("SAMPLE_DEPARTURES", "2"))  # quantas datas de IDA por destino
+    DAYS_AHEAD_TO   = int(os.getenv("DAYS_AHEAD_TO", "90"))
+    SAMPLE_DEPARTURES = int(os.getenv("SAMPLE_DEPARTURES", "2"))  # quantas datas de ida por destino
 
-    # ida + volta
-    ROUND_TRIP = os.getenv("ROUND_TRIP", "1").strip() == "1"
+    # round-trip (noites no destino)
+    ROUND_TRIP = os.getenv("ROUND_TRIP", "1") in ("1", "true", "True")
     STAY_NIGHTS_MIN = int(os.getenv("STAY_NIGHTS_MIN", "5"))
     STAY_NIGHTS_MAX = int(os.getenv("STAY_NIGHTS_MAX", "10"))
-    SAMPLE_STAYS = int(os.getenv("SAMPLE_STAYS", "0"))  # 0 = todas as noites; >0 = amostra aleatória
+    SAMPLE_STAYS    = int(os.getenv("SAMPLE_STAYS", "0"))  # 0 = testa todas as noites; 2 = testa 2 valores
 
-    # limites / API
-    MAX_OFFERS = int(os.getenv("MAX_OFFERS", "5"))
-    REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.2"))  # segundos entre chamadas
+    # API Amadeus / limites
+    AMADEUS_ENV = os.getenv("AMADEUS_ENV", "sandbox").strip().lower()
+    BASE_URL = "https://test.api.amadeus.com" if AMADEUS_ENV in ("sandbox", "test") else "https://api.amadeus.com"
+    MAX_OFFERS    = int(os.getenv("MAX_OFFERS", "5"))
+    REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.2"))
 
-# Ambiente Amadeus
+    # regras de alerta (aplicadas ao TOTAL ida+volta)
+    MAX_PRECO_PP        = float(os.getenv("MAX_PRECO_PP", "1200"))
+    MIN_DISCOUNT_PCT    = float(os.getenv("MIN_DISCOUNT_PCT", "0.25"))
+
+    # moeda
+    CURRENCY = os.getenv("CURRENCY", "BRL").strip().upper()
+
+    # paths
+    HISTORY_PATH     = Path(os.getenv("HISTORY_PATH", "data/history.csv"))
+    TOKEN_CACHE_PATH = Path(os.getenv("TOKEN_CACHE_PATH", "data/amadeus_token.json"))
+
+    # logging
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+
+# ---------------------------
+# Credenciais / Telegram
+# ---------------------------
 CLIENT_ID = os.getenv("AMADEUS_API_KEY")
 CLIENT_SECRET = os.getenv("AMADEUS_API_SECRET")
-ENV = os.getenv("AMADEUS_ENV", "sandbox").strip().lower()
-BASE_URL = "https://test.api.amadeus.com" if ENV in ("sandbox", "test") else "https://api.amadeus.com"
-
-# Telegram
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-# Regras de alerta (sobre o TOTAL ida+volta)
-MAX_PRECO_PP = float(os.getenv("MAX_PRECO_PP", "1200"))
-MIN_DISCOUNT_PCT = float(os.getenv("MIN_DISCOUNT_PCT", "0.25"))
-
-# Histórico
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-HISTORY_PATH = Path(os.getenv("HISTORY_PATH", str(DATA_DIR / "history.csv")))
-TOKEN_CACHE_PATH = Path(os.getenv("TOKEN_CACHE_PATH", str(DATA_DIR / "amadeus_token.json")))
-
-CSV_HEADERS = [
-    "ts_utc", "origem", "destino",
-    "departure_date", "return_date",
-    "price_ida", "airline_ida",
-    "price_volta", "airline_volta",
-    "total_price", "currency",
-    "notified", "reason"
-]
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 
-# =========================
-# Telegram
-# =========================
-def enviar_telegram(texto: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram não configurado. Pulando envio.")
+# ---------------------------
+# Utilitários
+# ---------------------------
+def log(msg: str, level: str = "INFO") -> None:
+    levels = ["DEBUG", "INFO", "WARNING", "ERROR"]
+    if level not in levels:
+        level = "INFO"
+    # simples filtro por nível
+    if levels.index(level) < levels.index(Config.LOG_LEVEL):
+        return
+    icons = {"DEBUG":"🐞","INFO":"ⓘ","WARNING":"⚠️","ERROR":"❌"}
+    print(f"[{datetime.utcnow().isoformat()}Z] {icons.get(level,' ')} {msg}")
+
+def ensure_dirs() -> None:
+    Config.HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    Config.TOKEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+def tg_send(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram não configurado. Pulando envio.", "WARNING")
         return
     try:
         r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": texto},
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": int(TELEGRAM_CHAT_ID), "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=20,
         )
-        r.raise_for_status()
-        log.info("Mensagem enviada ao Telegram.")
+        if r.status_code >= 400:
+            log(f"Falha ao enviar Telegram: {r.status_code} {r.text[:200]}", "WARNING")
+        else:
+            log("Mensagem enviada ao Telegram.", "INFO")
     except Exception as e:
-        log.error(f"Erro ao enviar Telegram: {e}")
+        log(f"Erro Telegram: {e}", "WARNING")
 
 
-# =========================
-# Histórico (CSV)
-# =========================
-def load_best_totals() -> Dict[Tuple[str, str], float]:
-    best: Dict[Tuple[str, str], float] = {}
-    if not HISTORY_PATH.exists():
-        return best
-    try:
-        with HISTORY_PATH.open("r", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                try:
-                    key = (row["origem"], row["destino"])
-                    total = float(row.get("total_price") or row.get("price_total") or "inf")
-                    if total != float("inf"):
-                        if key not in best or total < best[key]:
-                            best[key] = total
-                except Exception:
-                    continue
-    except Exception as e:
-        log.warning(f"Erro lendo histórico: {e}")
-    return best
-
-
-def append_history(row: Dict[str, Any]):
-    write_header = not HISTORY_PATH.exists()
-    try:
-        with HISTORY_PATH.open("a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=CSV_HEADERS)
-            if write_header:
-                w.writeheader()
-            w.writerow(row)
-    except Exception as e:
-        log.error(f"Erro gravando histórico: {e}")
-
-
-# =========================
+# ---------------------------
 # Token cache
-# =========================
-def _load_cached_token() -> Optional[str]:
+# ---------------------------
+def _read_token_cache() -> Optional[Dict[str, Any]]:
     try:
-        if TOKEN_CACHE_PATH.exists():
-            data = json.loads(TOKEN_CACHE_PATH.read_text(encoding="utf-8"))
-            token = data.get("access_token")
-            exp = data.get("expires_at")  # epoch (UTC)
-            if token and exp and time.time() < exp - 60:  # margem de 60s
-                return token
+        if Config.TOKEN_CACHE_PATH.exists():
+            with Config.TOKEN_CACHE_PATH.open("r", encoding="utf-8") as f:
+                return json.load(f)
     except Exception:
         pass
     return None
 
-
-def _save_token(token: str, expires_in: int):
+def _write_token_cache(token: str, expires_in: int) -> None:
     try:
-        payload = {"access_token": token, "expires_at": time.time() + int(expires_in)}
-        TOKEN_CACHE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+        data = {"access_token": token, "expires_at": (datetime.utcnow() + timedelta(seconds=expires_in - 30)).isoformat() + "Z"}
+        with Config.TOKEN_CACHE_PATH.open("w", encoding="utf-8") as f:
+            json.dump(data, f)
     except Exception as e:
-        log.warning(f"Não foi possível salvar token em cache: {e}")
+        log(f"Não foi possível gravar cache do token: {e}", "DEBUG")
 
 
 def get_token() -> str:
-    """
-    Mantém interface usada nos testes.
-    Retorna token do cache se válido; senão, solicita um novo.
-    """
-    cached = _load_cached_token()
-    if cached:
-        return cached
+    """Obtém (ou reusa) token OAuth2 da Amadeus."""
+    ensure_dirs()
+
+    # cache
+    cache = _read_token_cache()
+    if cache:
+        try:
+            exp = datetime.fromisoformat(cache["expires_at"].replace("Z", "+00:00"))
+            if datetime.utcnow() < exp and cache.get("access_token"):
+                return cache["access_token"]
+        except Exception:
+            pass
 
     if not CLIENT_ID or not CLIENT_SECRET:
-        log.error("AMADEUS_API_KEY/AMADEUS_API_SECRET ausentes.")
+        log("AMADEUS_API_KEY/AMADEUS_API_SECRET ausentes.", "ERROR")
         sys.exit(1)
 
     try:
         resp = requests.post(
-            f"{BASE_URL}/v1/security/oauth2/token",
-            data={"grant_type": "client_credentials",
-                  "client_id": CLIENT_ID,
-                  "client_secret": CLIENT_SECRET},
+            f"{Config.BASE_URL}/v1/security/oauth2/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+            },
             timeout=30,
-            headers={"User-Agent": "apgyn/1.1 (+monitor)"},
         )
         resp.raise_for_status()
-        js = resp.json()
-        token = js["access_token"]
-        # Amadeus retorna expires_in (segundos)
-        _save_token(token, int(js.get("expires_in", 1800)))
+        data = resp.json()
+        token = data["access_token"]
+        expires_in = int(data.get("expires_in", 1800))
+        _write_token_cache(token, expires_in)
         return token
     except requests.RequestException as e:
-        log.error(f"Falha ao obter token: {e}")
+        log(f"Falha ao obter token: {e}", "ERROR")
         sys.exit(1)
 
 
-def _refresh_token() -> str:
-    # invalida cache e força novo token
+# ---------------------------
+# Amadeus API helpers
+# ---------------------------
+def _carriers_dict(offers: Dict[str, Any]) -> Dict[str, str]:
+    """Extrai dicionário de cias do payload ('dictionaries' → 'carriers')."""
     try:
-        if TOKEN_CACHE_PATH.exists():
-            TOKEN_CACHE_PATH.unlink()
+        return offers.get("dictionaries", {}).get("carriers", {}) or {}
     except Exception:
-        pass
-    return get_token()
+        return {}
 
+def _price_total(offer: Dict[str, Any]) -> Optional[float]:
+    try:
+        return float(offer["price"]["total"])
+    except Exception:
+        return None
 
-# =========================
-# HTTP com retry/backoff
-# =========================
-RETRY_STATUS = {429, 500, 502, 503, 504}
-
-def _sleep_backoff(attempt: int):
-    base = 1.0 * (2 ** attempt)  # 1,2,4,8...
-    jitter = random.uniform(0, 0.4)
-    time.sleep(base + jitter)
-
-def request_with_retry(method: str, url: str, max_tries: int = 4, **kw) -> requests.Response:
-    """
-    Tenta até max_tries para status/transientes definidos.
-    Não faz refresh de token aqui; isso é tratado pelo caller (buscar_one_way).
-    """
-    for attempt in range(max_tries):
-        try:
-            resp = requests.request(method, url, timeout=60, **kw)
-            if resp.status_code in RETRY_STATUS:
-                log.warning(f"HTTP {resp.status_code} em {url}; tentativa {attempt+1}/{max_tries}")
-                if attempt < max_tries - 1:
-                    _sleep_backoff(attempt)
-                    continue
-            return resp
-        except requests.RequestException as e:
-            log.warning(f"Falha de rede em {url}: {e}; tentativa {attempt+1}/{max_tries}")
-            if attempt < max_tries - 1:
-                _sleep_backoff(attempt)
-                continue
-            raise
-    return resp  # tipo: ignore
-
-
-# =========================
-# Amadeus: helpers
-# =========================
-def _extract_airline_name(offer: Dict[str, Any], dictionaries: Optional[Dict[str, Any]]) -> str:
+def _airline_from_segments(offer: Dict[str, Any], carriers: Dict[str, str]) -> str:
+    """Tenta extrair nome da cia da primeira perna; prioriza operatingCarrier > marketingCarrier."""
     try:
         seg = offer["itineraries"][0]["segments"][0]
-        code = seg.get("carrierCode") or seg.get("marketingCarrier")
-        if dictionaries and "carriers" in dictionaries and code:
-            return dictionaries["carriers"].get(code) or code
+        op = seg.get("operating", {}).get("carrierCode") or seg.get("operatingCarrierCode") or seg.get("carrierCode")
+        mk = seg.get("carrierCode") or seg.get("marketingCarrierCode")
+        code = (op or mk or "").strip()
+        if code and carriers.get(code):
+            return carriers[code]
         return code or "N/A"
     except Exception:
         return "N/A"
 
-def _cheapest(offers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not offers or not offers.get("data"):
-        return None
-    try:
-        return min(offers["data"], key=lambda x: float(x["price"]["total"]))
-    except Exception:
-        return None
-
-
-def buscar_one_way(token: str, origem: str, destino: str, date: str) -> Optional[Tuple[float, str, str]]:
-    """
-    Busca menor preço ONE-WAY para (origem -> destino) em 'date'.
-    Retorna (preco, moeda, companhia).
-    Faz refresh de token automático em caso de 401.
-    """
-    url = f"{BASE_URL}/v2/shopping/flight-offers"
+def buscar_one_way(token: str, origem: str, destino: str, data: str, max_offers: int) -> Optional[Dict[str, Any]]:
+    """Chama /v2/shopping/flight-offers (one-way)"""
     params = {
         "originLocationCode": origem,
         "destinationLocationCode": destino,
-        "departureDate": date,
+        "departureDate": data,
         "adults": "1",
         "currencyCode": Config.CURRENCY,
-        "max": str(Config.MAX_OFFERS),
+        "max": str(max_offers),
     }
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "User-Agent": "apgyn/1.1 (+monitor)",
-        "Accept": "application/json",
-    }
-
+    headers = {"Authorization": f"Bearer {token}"}
     try:
-        resp = request_with_retry("GET", url, params=params, headers=headers)
-        if resp.status_code == 401:
-            # token expirou: renova e tenta 1x
-            log.info("Token expirado. Renovando…")
-            token2 = _refresh_token()
-            headers["Authorization"] = f"Bearer {token2}"
-            resp = request_with_retry("GET", url, params=params, headers=headers)
-
-        if resp.status_code >= 400:
-            log.warning(f"({origem}→{destino} {date}) HTTP {resp.status_code} {resp.text[:300]}")
+        r = requests.get(f"{Config.BASE_URL}/v2/shopping/flight-offers", headers=headers, params=params, timeout=60)
+        # Em sandbox, erros 5xx podem ocorrer com frequência
+        if r.status_code >= 500:
+            log(f"Sandbox 5xx em {origem}->{destino} {data}: {r.status_code}", "WARNING")
             return None
-
-        data = resp.json()
-        cheapest = _cheapest(data)
-        if not cheapest:
-            return None
-
-        price = float(cheapest["price"]["total"])
-        currency = cheapest["price"]["currency"]
-        airline = _extract_airline_name(cheapest, data.get("dictionaries"))
-        return price, currency, airline
-
+        r.raise_for_status()
+        return r.json()
     except requests.RequestException as e:
-        log.error(f"Erro na busca {origem}→{destino} {date}: {e}")
+        log(f"Erro buscar_one_way {origem}->{destino} {data}: {e}", "WARNING")
         return None
 
+def cheapest_offer(offers: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not offers or not offers.get("data"):
+        return None
+    best = None
+    best_price = float("inf")
+    carriers = _carriers_dict(offers)
+    for of in offers["data"]:
+        p = _price_total(of)
+        if p is None:
+            continue
+        if p < best_price:
+            best_price = p
+            best = of
+    if best:
+        # anota cia "amigável"
+        best["_airline_name"] = _airline_from_segments(best, carriers)
+        best["_currency"] = best.get("price", {}).get("currency", Config.CURRENCY)
+    return best
 
-# =========================
+
+# ---------------------------
+# Amostragem de datas
+# ---------------------------
+def gerar_datas_ida(n: int) -> List[str]:
+    hoje = datetime.utcnow().date()
+    out = set()
+    tentativas = 0
+    while len(out) < max(1, n) and tentativas < 20:
+        delta = random.randint(Config.DAYS_AHEAD_FROM, Config.DAYS_AHEAD_TO)
+        out.add((hoje + timedelta(days=delta)).strftime("%Y-%m-%d"))
+        tentativas += 1
+    return sorted(out)
+
+def gerar_noites() -> List[int]:
+    nights = list(range(Config.STAY_NIGHTS_MIN, Config.STAY_NIGHTS_MAX + 1))
+    if Config.SAMPLE_STAYS and Config.SAMPLE_STAYS > 0 and Config.SAMPLE_STAYS < len(nights):
+        random.seed(42)
+        nights = random.sample(nights, Config.SAMPLE_STAYS)
+    return sorted(nights)
+
+
+# ---------------------------
 # Regras de alerta
-# =========================
+# ---------------------------
 def deve_alertar(preco_atual: float, melhor_anterior: Optional[float]) -> Tuple[bool, str]:
-    # Regra 1: total ≤ teto
-    if preco_atual <= MAX_PRECO_PP:
-        return True, f"≤ teto {int(MAX_PRECO_PP)}"
-    # Regra 2: queda percentual vs histórico
-    if melhor_anterior and melhor_anterior != float("inf"):
-        desc = (melhor_anterior - preco_atual) / melhor_anterior
-        if desc >= MIN_DISCOUNT_PCT:
-            return True, f"queda {desc:.0%}"
+    """Retorna (alerta?, motivo) — usado nos testes unitários."""
+    if preco_atual <= Config.MAX_PRECO_PP:
+        return True, f"≤ teto {int(Config.MAX_PRECO_PP)}"
+    if melhor_anterior is not None and melhor_anterior < float("inf"):
+        desconto = (melhor_anterior - preco_atual) / melhor_anterior
+        if desconto >= Config.MIN_DISCOUNT_PCT:
+            return True, f"queda {desconto:.0%}"
     return False, "sem queda relevante"
 
 
-# =========================
-# Datas
-# =========================
-def gerar_datas_ida(n: int) -> List[str]:
-    hoje = datetime.utcnow().date()
-    datas: set[str] = set()
-    while len(datas) < n:
-        delta = random.randint(Config.DAYS_AHEAD_FROM, Config.DAYS_AHEAD_TO)
-        datas.add((hoje + timedelta(days=delta)).strftime("%Y-%m-%d"))
-    return sorted(datas)
+# ---------------------------
+# Histórico CSV
+# ---------------------------
+CSV_HEADERS = [
+    "ts_utc","origem","destino","departure_date","return_date",
+    "price_total","currency",
+    "price_outbound","airline_outbound",
+    "price_inbound","airline_inbound",
+    "notified","reason"
+]
 
-def noites_amostradas() -> List[int]:
-    """Retorna todas as noites no intervalo ou uma amostra aleatória se SAMPLE_STAYS>0."""
-    nights = list(range(Config.STAY_NIGHTS_MIN, Config.STAY_NIGHTS_MAX + 1))
-    if Config.SAMPLE_STAYS and Config.SAMPLE_STAYS < len(nights):
-        return sorted(random.sample(nights, Config.SAMPLE_STAYS))
-    return nights
+def load_best_totals() -> Dict[Tuple[str, str], float]:
+    best: Dict[Tuple[str, str], float] = {}
+    if not Config.HISTORY_PATH.exists():
+        return best
+    try:
+        with Config.HISTORY_PATH.open("r", encoding="utf-8") as f:
+            rd = csv.DictReader(f)
+            for row in rd:
+                try:
+                    key = (row["origem"], row["destino"])
+                    tot = float(row["price_total"])
+                    if key not in best or tot < best[key]:
+                        best[key] = tot
+                except Exception:
+                    continue
+    except Exception as e:
+        log(f"Erro lendo histórico: {e}", "WARNING")
+    return best
 
-def datas_retorno(dep_date: str) -> List[str]:
-    base = datetime.strptime(dep_date, "%Y-%m-%d").date()
-    return [(base + timedelta(days=n)).strftime("%Y-%m-%d") for n in noites_amostradas()]
+def append_history_row(row: Dict[str, Any]) -> None:
+    ensure_dirs()
+    write_header = not Config.HISTORY_PATH.exists()
+    try:
+        with Config.HISTORY_PATH.open("a", newline="", encoding="utf-8") as f:
+            wr = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+            if write_header:
+                wr.writeheader()
+            wr.writerow(row)
+    except Exception as e:
+        log(f"Erro escrevendo histórico: {e}", "ERROR")
 
 
-# =========================
-# Processamento
-# =========================
-def process_destino_roundtrip(token: str, origem: str, destino: str, best_map: Dict[Tuple[str, str], float]):
-    log.info(f"🔎 {origem} → {destino} (ida+volta)")
-    candidatos: List[Tuple[float, str, str, float, str, float, str, str]] = []
+# ---------------------------
+# Processamento por destino (round-trip com pernas independentes)
+# ---------------------------
+def process_destino_roundtrip(token: str, origem: str, destino: str, best_totals: Dict[Tuple[str, str], float]) -> None:
+    log(f"🔎 {origem} → {destino} (ida+volta)", "INFO")
+    datas_ida = gerar_datas_ida(Config.SAMPLE_DEPARTURES)
+    noites = gerar_noites()
 
-    for dep in gerar_datas_ida(Config.SAMPLE_DEPARTURES):
-        ida = buscar_one_way(token, origem, destino, dep)
+    best_combo = None  # (total, ida_date, volta_date, offer_ida, offer_volta)
+
+    for d_ida in datas_ida:
         time.sleep(Config.REQUEST_DELAY)
-        if not ida:
+        ida_offers = buscar_one_way(token, origem, destino, d_ida, Config.MAX_OFFERS)
+        ida_best = cheapest_offer(ida_offers)
+        if not ida_best:
+            log(f"Nenhuma ida encontrada {origem}->{destino} {d_ida}", "DEBUG")
             continue
-        ida_price, curr, ida_air = ida
+        preco_ida = _price_total(ida_best) or float("inf")
 
-        for ret in datas_retorno(dep):
-            volta = buscar_one_way(token, destino, origem, ret)
+        for nights in noites:
+            d_volta = (datetime.fromisoformat(d_ida) + timedelta(days=nights)).date().strftime("%Y-%m-%d")
             time.sleep(Config.REQUEST_DELAY)
-            if not volta:
+            volta_offers = buscar_one_way(token, destino, origem, d_volta, Config.MAX_OFFERS)
+            volta_best = cheapest_offer(volta_offers)
+            if not volta_best:
+                log(f"Nenhuma volta encontrada {destino}->{origem} {d_volta}", "DEBUG")
                 continue
-            volta_price, curr2, volta_air = volta
-            total = ida_price + volta_price
-            candidatos.append((total, dep, ret, ida_price, ida_air, volta_price, volta_air, curr))
+            preco_volta = _price_total(volta_best) or float("inf")
+            total = preco_ida + preco_volta
 
-    if not candidatos:
-        msg = f"❌ Sem ofertas para {origem} ↔ {destino} nas datas testadas."
-        log.info(msg)
-        enviar_telegram(msg)
+            if (best_combo is None) or (total < best_combo[0]):
+                best_combo = (total, d_ida, d_volta, ida_best, volta_best)
+
+    if not best_combo:
+        log(f"❌ Sem combinações para {origem}→{destino} nas janelas testadas.", "INFO")
         return
 
-    total, dep, ret, p_ida, air_ida, p_volta, air_volta, curr = min(candidatos, key=lambda x: x[0])
+    total, d_ida, d_volta, ida_best, volta_best = best_combo
+    cur = (ida_best.get("price", {}) or {}).get("currency", Config.CURRENCY)
+    cia_ida = ida_best.get("_airline_name", "N/A")
+    cia_volta = volta_best.get("_airline_name", "N/A")
 
+    # regra de alerta
     key = (origem, destino)
-    melhor_hist = best_map.get(key, float("inf"))
-    ok, motivo = deve_alertar(total, melhor_hist)
-
-    texto = (
-        f"✈️ {origem} ↔ {destino}\n"
-        f"• Ida {dep}: {p_ida:.2f} {curr} ({air_ida or 'N/A'})\n"
-        f"• Volta {ret}: {p_volta:.2f} {curr} ({air_volta or 'N/A'})\n"
-        f"• Total: {total:.2f} {curr} — {motivo}"
+    prev_best = best_totals.get(key, float("inf"))
+    alert, reason = deve_alertar(total, prev_best)
+    notified = False
+    msg = (
+        f"✈️ <b>{origem} → {destino}</b>\n"
+        f"• Ida {d_ida}: {(_price_total(ida_best) or 0):.2f} {cur} ({cia_ida})\n"
+        f"• Volta {d_volta}: {(_price_total(volta_best) or 0):.2f} {cur} ({cia_volta})\n"
+        f"• <b>Total</b>: {total:.2f} {cur} — {reason}"
     )
+    log(msg, "INFO")
+    if alert:
+        tg_send(msg)
+        notified = True
 
-    if ok:
-        enviar_telegram(texto)
-    else:
-        log.info(texto)
-
-    append_history({
+    # histórico
+    append_history_row({
         "ts_utc": datetime.utcnow().isoformat() + "Z",
         "origem": origem,
         "destino": destino,
-        "departure_date": dep,
-        "return_date": ret,
-        "price_ida": f"{p_ida:.2f}",
-        "airline_ida": air_ida or "",
-        "price_volta": f"{p_volta:.2f}",
-        "airline_volta": air_volta or "",
-        "total_price": f"{total:.2f}",
-        "currency": curr,
-        "notified": "1" if ok else "0",
-        "reason": motivo,
+        "departure_date": d_ida,
+        "return_date": d_volta,
+        "price_total": f"{total:.2f}",
+        "currency": cur,
+        "price_outbound": f"{(_price_total(ida_best) or 0):.2f}",
+        "airline_outbound": cia_ida,
+        "price_inbound": f"{(_price_total(volta_best) or 0):.2f}",
+        "airline_inbound": cia_volta,
+        "notified": "1" if notified else "0",
+        "reason": reason
     })
 
-    if total < melhor_hist:
-        best_map[key] = total
+    # atualiza melhor total
+    if total < prev_best:
+        best_totals[key] = total
 
 
-def main():
-    log.info(f"Iniciando monitor | ENV={ENV} | BASE={BASE_URL}")
+# ---------------------------
+# Main
+# ---------------------------
+def main() -> None:
+    log(f"Iniciando monitor | ENV={Config.AMADEUS_ENV} | BASE={Config.BASE_URL}", "INFO")
+    ensure_dirs()
     token = get_token()
-    best_map = load_best_totals()
+    best_totals = load_best_totals()
 
-    if Config.ROUND_TRIP:
-        for dest in Config.DESTINOS:
-            process_destino_roundtrip(token, Config.ORIGEM, dest, best_map)
-    else:
-        log.warning("ROUND_TRIP=0 não suportado nesta versão (use ida+volta).")
+    for dest in Config.DESTINOS:
+        try:
+            process_destino_roundtrip(token, Config.ORIGEM, dest, best_totals)
+        except Exception as e:
+            log(f"Erro processando {Config.ORIGEM}->{dest}: {e}", "WARNING")
 
-    log.info("Execução finalizada.")
+    log("Monitoramento concluído.", "INFO")
 
+
+# Exporta funções usadas nos testes
+__all__ = [
+    "get_token",
+    "deve_alertar",
+    "buscar_one_way",
+    "cheapest_offer",
+    "process_destino_roundtrip",
+    "Config"
+]
 
 if __name__ == "__main__":
     main()
