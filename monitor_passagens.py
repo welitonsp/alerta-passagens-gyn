@@ -70,8 +70,8 @@ SAMPLE_DEPARTURES = int(os.getenv("SAMPLE_DEPARTURES", "2"))
 STAY_NIGHTS_MIN   = int(os.getenv("STAY_NIGHTS_MIN", "5"))
 STAY_NIGHTS_MAX   = int(os.getenv("STAY_NIGHTS_MAX", "10"))
 
-MAX_OFFERS    = int(os.getenv("MAX_OFFERS", "5"))
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.2"))
+MAX_OFFERS      = int(os.getenv("MAX_OFFERS", "5"))
+REQUEST_DELAY   = float(os.getenv("REQUEST_DELAY", "1.2"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30"))
 
 # Regras (testes mexem nessas variáveis em runtime)
@@ -145,14 +145,20 @@ def _safe_float(value: Any, default: float = float("inf")) -> float:
 
 # ============== Funções exigidas pelos testes ==============
 def get_token() -> str:
+    """Usa requests.post (não SESSION) para permitir o monkeypatch dos testes."""
     if not CLIENT_ID or not CLIENT_SECRET:
         log("AMADEUS_API_KEY/AMADEUS_API_SECRET ausentes.", "ERROR")
         sys.exit(1)
     try:
-        resp = SESSION.post(
+        resp = requests.post(  # ← importante para os testes
             f"{BASE_URL}/v1/security/oauth2/token",
-            data={"grant_type":"client_credentials","client_id":CLIENT_ID,"client_secret":CLIENT_SECRET},
+            data={
+                "grant_type": "client_credentials",
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+            },
             timeout=REQUEST_TIMEOUT,
+            headers={"User-Agent": USER_AGENT},
         )
         if resp.status_code != 200:
             log(f"Falha ao obter token: {resp.status_code} {resp.text[:200]}", "ERROR")
@@ -226,7 +232,6 @@ def buscar_one_way(token: str, origem: str, destino: str, date_yyyy_mm_dd: str) 
             f"{BASE_URL}/v2/shopping/flight-offers",
             headers=headers, params=params, timeout=REQUEST_TIMEOUT,
         )
-        # Tratamento básico de rate limit: se 429, aumenta pausa temporária
         if r.status_code == 429:
             log("429 recebido. Aumentando delay temporariamente.", "WARNING")
             time.sleep(max(3.0, REQUEST_DELAY * 2))
@@ -299,12 +304,10 @@ def _datas_ida() -> List[str]:
         delta = random.randint(DAYS_AHEAD_FROM, DAYS_AHEAD_TO)
         out.append((hoje + timedelta(days=delta)).strftime("%Y-%m-%d"))
     # dedup mantendo ordem
-    seen = set()
-    dedup = []
+    seen = set(); dedup = []
     for d in out:
         if d not in seen:
-            seen.add(d)
-            dedup.append(d)
+            seen.add(d); dedup.append(d)
     return dedup
 
 def _datas_retorno_para(ida: str) -> List[str]:
