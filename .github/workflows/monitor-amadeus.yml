@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write           # Necessário para comitar data/history.csv
+  contents: write
 
 jobs:
   monitor:
@@ -40,7 +40,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Verifica se os secrets obrigatórios estão presentes
       - name: Preflight - conferir secrets
         env:
           AMADEUS_API_KEY:    ${{ secrets.AMADEUS_API_KEY }}
@@ -58,7 +57,6 @@ jobs:
           print("✔ Secrets OK")
           PY
 
-      # Opcional: ping simples no Telegram (não falha pipeline)
       - name: Ping Telegram (opcional)
         continue-on-error: true
         env:
@@ -74,24 +72,20 @@ jobs:
               print("HTTP", r.status_code, r.text[:200])
           PY
 
-      # Opcional: checa OAuth da Amadeus (não falha em caso de 5xx)
       - name: Preflight - token Amadeus (opcional)
         continue-on-error: true
         env:
           AMADEUS_API_KEY:    ${{ secrets.AMADEUS_API_KEY }}
           AMADEUS_API_SECRET: ${{ secrets.AMADEUS_API_SECRET }}
-          AMADEUS_ENV:        sandbox
         run: |
           python - <<'PY'
           import os, requests
-          env=os.getenv("AMADEUS_ENV","sandbox").lower()
-          base="https://test.api.amadeus.com" if env in ("sandbox","test") else "https://api.amadeus.com"
+          base="https://test.api.amadeus.com"
           r=requests.post(f"{base}/v1/security/oauth2/token",
                           data={"grant_type":"client_credentials",
                                 "client_id":os.getenv("AMADEUS_API_KEY"),
                                 "client_secret":os.getenv("AMADEUS_API_SECRET")}, timeout=30)
-          print("OAuth status:", r.status_code)
-          print(r.text[:300])
+          print("OAuth status:", r.status_code, r.text[:300])
           PY
 
       - name: Run monitor (Amadeus)
@@ -103,34 +97,30 @@ jobs:
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
 
           # --- ambiente / logs ---
-          AMADEUS_ENV: sandbox          # fique no sandbox (teste)
-          LOG_LEVEL: INFO               # DEBUG, INFO, WARNING, ERROR
+          AMADEUS_ENV: sandbox
+          LOG_LEVEL: INFO
 
           # --- parâmetros do monitor ---
           ORIGEM: GYN
-          DESTINOS: GIG,SDU,SSA,FOR,REC,NAT,MCZ,AJU,MAO,BEL,SLZ,THE,BSB,FLN,POA,CWB,CGR,CGB,CNF,VIX,JPA,PMW,PVH,BVB,RBR,GRU,CGH
+          DESTINOS: RBR,MAO,MCP,BEL,PVH,BVB,PMW,MCZ,SSA,FOR,SLZ,JPA,REC,THE,NAT,AJU,BSB,CGB,CGR,VIX,CNF,SDU,GIG,CGH,GRU,CWB,POA,FLN
           CURRENCY: BRL
 
-          # amostragem de datas
           DAYS_AHEAD_FROM: "10"
           DAYS_AHEAD_TO:   "90"
-          SAMPLE_DEPARTURES: "2"    # datas de ida testadas por destino
 
-          # ida+volta (noites)
+          SAMPLE_DEPARTURES: "2"    # datas de ida por destino
+
           ROUND_TRIP: "1"
           STAY_NIGHTS_MIN: "5"
           STAY_NIGHTS_MAX: "10"
-          SAMPLE_STAYS: "0"         # 0 = todas as noites; use 2-3 para reduzir chamadas
+          SAMPLE_STAYS: "0"         # 0 = testa todas; 2-3 para reduzir chamadas
 
-          # limites / API
           MAX_OFFERS: "5"
           REQUEST_DELAY: "1.2"
 
-          # regras de alerta (aplicadas ao TOTAL ida+volta)
           MAX_PRECO_PP: "1200"
           MIN_DISCOUNT_PCT: "0.25"
 
-          # paths
           HISTORY_PATH: data/history.csv
           TOKEN_CACHE_PATH: data/amadeus_token.json
         run: |
