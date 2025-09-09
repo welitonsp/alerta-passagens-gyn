@@ -1,31 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Monitor de passagens (Amadeus + Telegram) — SANDBOX por padrão
-
-- Origem fixa GYN (Goiania) por padrão (pode sobrescrever via ORIGEM).
-- Destinos = capitais do Brasil (ou via DESTINOS), excluindo a própria origem.
-- Busca ida e volta separadas (menor ida + menor volta; podem ser companhias diferentes).
-- Regras de alerta por teto e por queda percentual vs histórico.
-- CSV de histórico; Telegram; deeplink Google Flights.
-- Retry com backoff; sessão HTTP; timeouts.
-- Test-friendly: get_token usa requests.post; deve_alertar aceita kwargs.
-
-ENV principais:
-  AMADEUS_ENV=sandbox|production (default: sandbox)
-  AMADEUS_API_KEY, AMADEUS_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  ORIGEM, DESTINOS
-  CURRENCY, DAYS_AHEAD_FROM, DAYS_AHEAD_TO, SAMPLE_DEPARTURES
-  STAY_NIGHTS_MIN, STAY_NIGHTS_MAX
-  MAX_OFFERS, REQUEST_DELAY, REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_FACTOR, USER_AGENT
-  TIME_BUDGET_SECONDS
-  HISTORY_PATH
-  MAX_PRECO_PP, ONLY_CAP_BELOW, LEG_CAP_ENFORCE_BOTH, MIN_DISCOUNT_PCT
-  SHOW_RETURN_ALTS, ALT_TOP_N, ALT_MIN_SAVING_BRL
-  TG_PARSE_MODE
-"""
-
 from __future__ import annotations
 
 import os
@@ -40,12 +15,9 @@ from typing import Dict, Tuple, Optional, List
 
 import requests
 
-# =========================
-# Helpers (evitam NameError no corpo da classe)
-# =========================
+# ========= Helpers =========
 
 def _capitais_padrao() -> str:
-    # Capitais + hubs comuns (sem GYN; GYN pode vir no env e será removido)
     return (
         "GIG,SDU,SSA,FOR,REC,NAT,MCZ,AJU,MAO,BEL,SLZ,THE,BSB,FLN,POA,CWB,"
         "CGR,CGB,CNF,VIX,JPA,PMW,PVH,BVB,RBR,GRU,CGH"
@@ -54,19 +26,19 @@ def _capitais_padrao() -> str:
 def _build_destinos(origem: str) -> List[str]:
     capital_str = os.getenv("DESTINOS", _capitais_padrao())
     lst = [d.strip().upper() for d in capital_str.split(",") if d.strip()]
-    # remove duplicados preservando ordem
     lst = list(dict.fromkeys(lst))
-    # remove a própria origem
     return [d for d in lst if d != origem]
 
-# =========================
-# Config
-# =========================
+def _safe_float(v, default=math.inf) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+# ========= Config =========
 
 class Config:
     ORIGEM = (os.getenv("ORIGEM", "GYN") or "GYN").strip().upper()
-
-    # será preenchido depois da classe
     DESTINOS: List[str] = []
 
     CURRENCY = os.getenv("CURRENCY", "BRL")
@@ -83,7 +55,7 @@ class Config:
     REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30"))
     MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
     BACKOFF_FACTOR = float(os.getenv("BACKOFF_FACTOR", "0.7"))
-    USER_AGENT = os.getenv("USER_AGENT", "FlightMonitor/1.3 (+github-actions)")
+    USER_AGENT = os.getenv("USER_AGENT", "FlightMonitor/1.4 (+github-actions)")
     TIME_BUDGET_SECONDS = int(os.getenv("TIME_BUDGET_SECONDS", "420"))
 
     HISTORY_PATH = Path(os.getenv("HISTORY_PATH", "data/history.csv"))
@@ -95,7 +67,7 @@ class Config:
     LEG_CAP_ENFORCE_BOTH = os.getenv("LEG_CAP_ENFORCE_BOTH", "false").lower() == "true"
     MIN_DISCOUNT_PCT = float(os.getenv("MIN_DISCOUNT_PCT", "0.25"))
 
-    # Alternativas de volta (informativo)
+    # Alternativas de volta
     SHOW_RETURN_ALTS = os.getenv("SHOW_RETURN_ALTS", "true").lower() == "true"
     ALT_TOP_N = int(os.getenv("ALT_TOP_N", "3"))
     ALT_MIN_SAVING_BRL = float(os.getenv("ALT_MIN_SAVING_BRL", "0"))
@@ -103,12 +75,15 @@ class Config:
     # Telegram
     TG_PARSE_MODE = os.getenv("TG_PARSE_MODE", "HTML")
 
-# Preenche destinos AGORA, fora do corpo da classe (evita NameError)
+    # IA (opcional)
+    AI_MODE = os.getenv("AI_MODE", "false").lower() == "true"
+    AI_ENGINE = os.getenv("AI_ENGINE", "heuristic")  # heuristic | sklearn
+    AI_ADD_TO_ALERT = os.getenv("AI_ADD_TO_ALERT", "false").lower() == "true"
+    AI_MIN_UNDERVALUE_PCT = float(os.getenv("AI_MIN_UNDERVALUE_PCT", "0.12"))  # 12% abaixo da previsão
+
 Config.DESTINOS = _build_destinos(Config.ORIGEM)
 
-# =========================
-# Credenciais / Ambiente
-# =========================
+# ========= Credenciais / Ambiente =========
 
 CLIENT_ID = os.getenv("AMADEUS_API_KEY")
 CLIENT_SECRET = os.getenv("AMADEUS_API_SECRET")
@@ -118,11 +93,11 @@ BASE_URL = "https://test.api.amadeus.com" if ENV in ("sandbox", "test") else "ht
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-# Para os testes poderem ajustar sem mexer em Config
+# Expostos para testes
 MAX_PRECO_PP = Config.MAX_PRECO_PP
 MIN_DISCOUNT_PCT = Config.MIN_DISCOUNT_PCT
 
-# Sessão HTTP com User-Agent
+# Sessão HTTP
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": Config.USER_AGENT})
 
@@ -134,19 +109,11 @@ CSV_HEADERS = [
     "notified","reason","deeplink"
 ]
 
-# =========================
-# Utilitários
-# =========================
+# ========= Util =========
 
 def log(msg: str, level: str = "INFO"):
     icons = {"INFO":"ⓘ", "SUCCESS":"✅", "ERROR":"❌", "WARNING":"⚠️"}
     print(f"[{datetime.utcnow().isoformat()}Z] {icons.get(level, ' ')} {msg}")
-
-def _safe_float(v, default=math.inf) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return default
 
 def tg_send(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -168,9 +135,7 @@ def google_flights_deeplink(orig: str, dest: str, ida: str, volta: Optional[str]
         return f"https://www.google.com/travel/flights?q=Flights%20from%20{orig}%20to%20{dest}%20on%20{ida}%20return%20{volta}"
     return f"https://www.google.com/travel/flights?q=Flights%20from%20{orig}%20to%20{dest}%20on%20{ida}"
 
-# =========================
-# Histórico CSV
-# =========================
+# ========= Histórico =========
 
 def load_best_totals() -> Dict[Tuple[str, str], float]:
     best: Dict[Tuple[str,str], float] = {}
@@ -201,15 +166,9 @@ def append_history_row(row: Dict[str, str]):
     except Exception as e:
         log(f"Erro salvando histórico: {e}", "ERROR")
 
-# =========================
-# Amadeus API
-# =========================
+# ========= Amadeus =========
 
 def get_token() -> str:
-    """
-    Usa requests.post (não SESSION) para facilitar monkeypatch nos testes.
-    Retry com backoff e timeouts.
-    """
     if not CLIENT_ID or not CLIENT_SECRET:
         log("AMADEUS_API_KEY/AMADEUS_API_SECRET ausentes.", "ERROR")
         sys.exit(1)
@@ -284,32 +243,19 @@ def _cheapest(offers: Optional[dict]) -> Optional[dict]:
     except Exception:
         return None
 
-# =========================
-# Regras de alerta (usadas nos testes)
-# =========================
+# ========= Regras de alerta =========
 
 def deve_alertar(preco_atual: float, melhor_anterior: Optional[float]) -> Tuple[bool, str]:
-    """
-    Regras:
-      - Se preco_atual <= MAX_PRECO_PP -> alerta ("≤ teto {MAX_PRECO_PP}")
-      - Senão, se queda >= MIN_DISCOUNT_PCT vs melhor_anterior -> alerta ("queda {pct:.0%}")
-      - Caso contrário -> ("sem queda")
-    """
     if preco_atual <= MAX_PRECO_PP:
-        # formata sem .0 se inteiro
-        cap = int(MAX_PRECO_PP) if MAX_PRECO_PP.is_integer() else MAX_PRECO_PP
+        cap = int(MAX_PRECO_PP) if isinstance(MAX_PRECO_PP, (int, float)) and float(MAX_PRECO_PP).is_integer() else MAX_PRECO_PP
         return True, f"≤ teto {cap}"
-
     if melhor_anterior is not None and math.isfinite(melhor_anterior) and melhor_anterior > 0:
         queda = (melhor_anterior - preco_atual) / melhor_anterior
         if queda >= MIN_DISCOUNT_PCT:
             return True, f"queda {queda:.0%}"
-
     return False, "sem queda"
 
-# =========================
-# Lógica principal (ida + volta)
-# =========================
+# ========= Datas =========
 
 def _datas_ida(hoje: datetime.date) -> List[str]:
     out = set()
@@ -320,7 +266,45 @@ def _datas_ida(hoje: datetime.date) -> List[str]:
 
 def _datas_retorno(ida: str) -> List[str]:
     d = datetime.strptime(ida, "%Y-%m-%d").date()
-    return [(d + timedelta(days=n)).strftime("%Y-%m-%d") for n in range(Config.STAY_NIGHTS_MIN, Config.STAY_NIGHTS_MAX + 1)]
+    return [(d + timedelta(days=n)).strftime("%Y-%m-%d")
+            for n in range(Config.STAY_NIGHTS_MIN, Config.STAY_NIGHTS_MAX + 1)]
+
+# ========= IA (opcional) =========
+
+_AI = None
+def _ensure_ai_loaded():
+    global _AI
+    if _AI is not None:
+        return _AI
+    try:
+        from ai_mode import load_predictor
+        pred, info = load_predictor(Config.HISTORY_PATH, Config.CURRENCY, Config.AI_ENGINE)
+        _AI = (pred, info)
+        log(f"IA carregada: {info}")
+        return _AI
+    except Exception as e:
+        log(f"IA desativada (erro ao carregar): {e}", "WARNING")
+        _AI = (None, "disabled")
+        return _AI
+
+def _ai_insights(orig: str, dest: str, ida: str, volta: str, total: float) -> str:
+    if not Config.AI_MODE:
+        return ""
+    predictor, _info = _ensure_ai_loaded()
+    if predictor is None:
+        return ""
+    try:
+        pred = float(predictor.predict_total(orig, dest, ida, volta))
+        if pred <= 0 or not math.isfinite(pred):
+            return ""
+        diff = total - pred
+        pct = (diff / pred) * 100.0
+        tag = "abaixo" if pct < 0 else "acima"
+        return f"IA: {abs(pct):.1f}% {tag} do esperado (pred. {pred:.0f} {Config.CURRENCY})"
+    except Exception:
+        return ""
+
+# ========= Mensagem =========
 
 def _format_return_alts(melhores_voltas: List[Tuple[str, dict, float]]) -> str:
     if not Config.SHOW_RETURN_ALTS or len(melhores_voltas) <= 1:
@@ -328,14 +312,14 @@ def _format_return_alts(melhores_voltas: List[Tuple[str, dict, float]]) -> str:
     base_date, base_offer, base_price = melhores_voltas[0]
     others = []
     for r_date, r_offer, r_price in melhores_voltas[1:Config.ALT_TOP_N + 1]:
-        saving = r_price - base_price
-        if saving >= Config.ALT_MIN_SAVING_BRL:
+        delta = r_price - base_price
+        if delta >= Config.ALT_MIN_SAVING_BRL:
             others.append(f"• {r_date}: {r_price:.2f} {Config.CURRENCY} ({r_offer.get('airline','N/A')})")
     if not others:
         return ""
     return "<i>Alternativas de volta:</i>\n" + "\n".join(others)
 
-def _format_msg_roundtrip(orig, dest, date_out, out_offer, ret_date, ret_offer, motivo, deeplink, alts_text=""):
+def _format_msg_roundtrip(orig, dest, date_out, out_offer, ret_date, ret_offer, motivo, deeplink, alts_text="", ia_text=""):
     p_out = _safe_float(out_offer["price"]["total"])
     p_ret = _safe_float(ret_offer["price"]["total"])
     tot = p_out + p_ret
@@ -348,11 +332,15 @@ def _format_msg_roundtrip(orig, dest, date_out, out_offer, ret_date, ret_offer, 
         f"• <b>Volta</b> {ret_date}: {p_ret:.2f} {Config.CURRENCY} ({air_ret})",
         f"• <b>Total:</b> {tot:.2f} {Config.CURRENCY} — {motivo}",
     ]
+    if ia_text:
+        lines.append(ia_text)
     if deeplink:
         lines.append(f"🔗 {deeplink}")
     if alts_text:
         lines.append(alts_text)
     return "\n".join(lines)
+
+# ========= Núcleo =========
 
 def process_destino_roundtrip(token: str, origem: str, destino: str, best_totals: Dict[Tuple[str,str], float], deadline: float):
     for ida in _datas_ida(datetime.utcnow().date()):
@@ -387,63 +375,65 @@ def process_destino_roundtrip(token: str, origem: str, destino: str, best_totals
         ret_date, ret_offer, preco_ret = melhores_voltas[0]
         total = preco_ida + preco_ret
 
-        # Regras rígidas de teto por trecho (se habilitadas)
         if Config.LEG_CAP_ENFORCE_BOTH and (preco_ida > Config.MAX_PRECO_PP or preco_ret > Config.MAX_PRECO_PP):
             continue
 
-        # Modo "somente abaixo do teto nos 2 trechos"
+        # ===== Modo "apenas abaixo do teto nos 2 trechos" =====
         if Config.ONLY_CAP_BELOW:
             if preco_ida <= Config.MAX_PRECO_PP and preco_ret <= Config.MAX_PRECO_PP:
-                cap = int(Config.MAX_PRECO_PP) if Config.MAX_PRECO_PP.is_integer() else Config.MAX_PRECO_PP
+                cap = int(Config.MAX_PRECO_PP) if float(Config.MAX_PRECO_PP).is_integer() else Config.MAX_PRECO_PP
                 motivo = f"≤ teto {cap}"
                 deeplink = google_flights_deeplink(origem, destino, ida, ret_date)
+                ia_text = _ai_insights(origem, destino, ida, ret_date, total)
                 msg = _format_msg_roundtrip(origem, destino, ida, off_ida, ret_date, ret_offer, motivo, deeplink,
-                                            alts_text=_format_return_alts(melhores_voltas))
+                                            alts_text=_format_return_alts(melhores_voltas),
+                                            ia_text=ia_text)
                 tg_send(msg)
                 append_history_row({
                     "ts_utc": datetime.utcnow().isoformat()+"Z",
-                    "origem": origem,
-                    "destino": destino,
-                    "departure_date": ida,
-                    "return_date": ret_date,
-                    "price_total": f"{total:.2f}",
-                    "currency": Config.CURRENCY,
-                    "leg_out_price": f"{preco_ida:.2f}",
-                    "leg_out_airline": off_ida.get("airline","N/A"),
-                    "leg_ret_price": f"{preco_ret:.2f}",
-                    "leg_ret_airline": ret_offer.get("airline","N/A"),
-                    "notified": "1",
-                    "reason": motivo,
+                    "origem": origem, "destino": destino,
+                    "departure_date": ida, "return_date": ret_date,
+                    "price_total": f"{total:.2f}", "currency": Config.CURRENCY,
+                    "leg_out_price": f"{preco_ida:.2f}", "leg_out_airline": off_ida.get("airline","N/A"),
+                    "leg_ret_price": f"{preco_ret:.2f}", "leg_ret_airline": ret_offer.get("airline","N/A"),
+                    "notified": "1", "reason": motivo,
                     "deeplink": deeplink
                 })
-                key = (origem, destino)
-                if key not in best_totals or total < best_totals[key]:
-                    best_totals[key] = total
             continue
 
-        # Regra de queda vs histórico (total)
+        # ===== Regra histórica padrão =====
         key = (origem, destino)
         melhor_hist = best_totals.get(key, math.inf)
         ok, motivo = deve_alertar(total, melhor_hist if math.isfinite(melhor_hist) else None)
+
+        # ===== Regra IA opcional (só se não alertou ainda) =====
+        ia_text = _ai_insights(origem, destino, ida, ret_date, total)
+        if Config.AI_MODE and Config.AI_ADD_TO_ALERT and not ok and ia_text:
+            # se está X% abaixo do previsto, também alerta
+            try:
+                # extrai % do texto "IA: 18.4% abaixo ..."
+                pct_str = ia_text.split(":")[1].split("%")[0].strip()
+                pct_val = abs(float(pct_str))
+                if pct_val/100.0 >= Config.AI_MIN_UNDERVALUE_PCT and "abaixo" in ia_text:
+                    ok = True
+                    motivo = f"IA {pct_val:.0f}% abaixo do previsto"
+            except Exception:
+                pass
+
         if ok:
             deeplink = google_flights_deeplink(origem, destino, ida, ret_date)
             msg = _format_msg_roundtrip(origem, destino, ida, off_ida, ret_date, ret_offer, motivo, deeplink,
-                                        alts_text=_format_return_alts(melhores_voltas))
+                                        alts_text=_format_return_alts(melhores_voltas),
+                                        ia_text=ia_text)
             tg_send(msg)
             append_history_row({
                 "ts_utc": datetime.utcnow().isoformat()+"Z",
-                "origem": origem,
-                "destino": destino,
-                "departure_date": ida,
-                "return_date": ret_date,
-                "price_total": f"{total:.2f}",
-                "currency": Config.CURRENCY,
-                "leg_out_price": f"{preco_ida:.2f}",
-                "leg_out_airline": off_ida.get("airline","N/A"),
-                "leg_ret_price": f"{preco_ret:.2f}",
-                "leg_ret_airline": ret_offer.get("airline","N/A"),
-                "notified": "1",
-                "reason": motivo,
+                "origem": origem, "destino": destino,
+                "departure_date": ida, "return_date": ret_date,
+                "price_total": f"{total:.2f}", "currency": Config.CURRENCY,
+                "leg_out_price": f"{preco_ida:.2f}", "leg_out_airline": off_ida.get("airline","N/A"),
+                "leg_ret_price": f"{preco_ret:.2f}", "leg_ret_airline": ret_offer.get("airline","N/A"),
+                "notified": "1", "reason": motivo,
                 "deeplink": deeplink
             })
             if total < melhor_hist:
@@ -451,27 +441,23 @@ def process_destino_roundtrip(token: str, origem: str, destino: str, best_totals
         else:
             append_history_row({
                 "ts_utc": datetime.utcnow().isoformat()+"Z",
-                "origem": origem,
-                "destino": destino,
-                "departure_date": ida,
-                "return_date": ret_date,
-                "price_total": f"{total:.2f}",
-                "currency": Config.CURRENCY,
-                "leg_out_price": f"{preco_ida:.2f}",
-                "leg_out_airline": off_ida.get("airline","N/A"),
-                "leg_ret_price": f"{preco_ret:.2f}",
-                "leg_ret_airline": ret_offer.get("airline","N/A"),
-                "notified": "0",
-                "reason": "sem queda",
+                "origem": origem, "destino": destino,
+                "departure_date": ida, "return_date": ret_date,
+                "price_total": f"{total:.2f}", "currency": Config.CURRENCY,
+                "leg_out_price": f"{preco_ida:.2f}", "leg_out_airline": off_ida.get("airline","N/A"),
+                "leg_ret_price": f"{preco_ret:.2f}", "leg_ret_airline": ret_offer.get("airline","N/A"),
+                "notified": "0", "reason": "sem queda",
                 "deeplink": google_flights_deeplink(origem, destino, ida, ret_date)
             })
 
-# =========================
-# Main
-# =========================
+# ========= Main =========
 
 def main():
     log(f"Iniciando monitor | ENV={ENV} ({'🚀 PRODUÇÃO' if ENV=='production' else '🧪 SANDBOX'}) | BASE={BASE_URL}")
+    if Config.AI_MODE:
+        # carrega IA já no início (log informativo)
+        _ensure_ai_loaded()
+
     token = get_token()
     best_totals = load_best_totals()
     deadline = time.time() + Config.TIME_BUDGET_SECONDS
