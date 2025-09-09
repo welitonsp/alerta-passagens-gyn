@@ -2,20 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-Monitor de passagens Amadeus + Telegram (sandbox por padrão)
+Monitor de passagens (Amadeus + Telegram) — SANDBOX por padrão
 
-- Origem fixa GYN (Goiania), destinos = capitais (ex-GYN) a partir de env DESTINOS ou padrão.
-- Busca ida e volta separadas (menor ida + menor volta, companhias podem ser diferentes).
-- Filtros por teto por trecho (ex: 550) e desconto vs melhor histórico.
-- Alternativas de volta (informativas).
-- Histórico CSV e link do Google Flights.
-- Retry com backoff, sessão HTTP com User-Agent.
-- Funções chaves testáveis: get_token, deve_alertar.
+- Origem fixa GYN (Goiania) por padrão (pode sobrescrever via ORIGEM).
+- Destinos = capitais do Brasil (ou via DESTINOS), excluindo a própria origem.
+- Busca ida e volta separadas (menor ida + menor volta; podem ser companhias diferentes).
+- Regras de alerta por teto e por queda percentual vs histórico.
+- CSV de histórico; Telegram; deeplink Google Flights.
+- Retry com backoff; sessão HTTP; timeouts.
+- Test-friendly: get_token usa requests.post; deve_alertar aceita kwargs.
 
-Variáveis principais (ENV):
-  AMADEUS_ENV = sandbox | production  (default: sandbox)
+ENV principais:
+  AMADEUS_ENV=sandbox|production (default: sandbox)
   AMADEUS_API_KEY, AMADEUS_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  ORIGEM, DESTINOS, DAYS_AHEAD_FROM, DAYS_AHEAD_TO, SAMPLE_DEPARTURES
+  ORIGEM, DESTINOS
+  CURRENCY, DAYS_AHEAD_FROM, DAYS_AHEAD_TO, SAMPLE_DEPARTURES
   STAY_NIGHTS_MIN, STAY_NIGHTS_MAX
   MAX_OFFERS, REQUEST_DELAY, REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_FACTOR, USER_AGENT
   TIME_BUDGET_SECONDS
@@ -35,28 +36,38 @@ import math
 import random
 from pathlib import Path
 from datetime import datetime, timedelta
-from collections import defaultdict
 from typing import Dict, Tuple, Optional, List
 
 import requests
 
 # =========================
-# Config / Constantes
+# Helpers (evitam NameError no corpo da classe)
 # =========================
 
-class Config:
-    # Origem fixa GYN (pedido do usuário)
-    ORIGEM = os.getenv("ORIGEM", "GYN").strip().upper() or "GYN"
-
-    # Capitais BR (IATA) exceto GYN
-    _capitais = (
+def _capitais_padrao() -> str:
+    # Capitais + hubs comuns (sem GYN; GYN pode vir no env e será removido)
+    return (
         "GIG,SDU,SSA,FOR,REC,NAT,MCZ,AJU,MAO,BEL,SLZ,THE,BSB,FLN,POA,CWB,"
         "CGR,CGB,CNF,VIX,JPA,PMW,PVH,BVB,RBR,GRU,CGH"
     )
-    DESTINOS = [
-        d.strip().upper() for d in dict.fromkeys(os.getenv("DESTINOS", _capitais).split(","))
-        if d.strip().upper() and d.strip().upper() != ORIGEM
-    ]
+
+def _build_destinos(origem: str) -> List[str]:
+    capital_str = os.getenv("DESTINOS", _capitais_padrao())
+    lst = [d.strip().upper() for d in capital_str.split(",") if d.strip()]
+    # remove duplicados preservando ordem
+    lst = list(dict.fromkeys(lst))
+    # remove a própria origem
+    return [d for d in lst if d != origem]
+
+# =========================
+# Config
+# =========================
+
+class Config:
+    ORIGEM = (os.getenv("ORIGEM", "GYN") or "GYN").strip().upper()
+
+    # será preenchido depois da classe
+    DESTINOS: List[str] = []
 
     CURRENCY = os.getenv("CURRENCY", "BRL")
 
@@ -84,7 +95,7 @@ class Config:
     LEG_CAP_ENFORCE_BOTH = os.getenv("LEG_CAP_ENFORCE_BOTH", "false").lower() == "true"
     MIN_DISCOUNT_PCT = float(os.getenv("MIN_DISCOUNT_PCT", "0.25"))
 
-    # Alternativas volta (informativo)
+    # Alternativas de volta (informativo)
     SHOW_RETURN_ALTS = os.getenv("SHOW_RETURN_ALTS", "true").lower() == "true"
     ALT_TOP_N = int(os.getenv("ALT_TOP_N", "3"))
     ALT_MIN_SAVING_BRL = float(os.getenv("ALT_MIN_SAVING_BRL", "0"))
@@ -92,28 +103,34 @@ class Config:
     # Telegram
     TG_PARSE_MODE = os.getenv("TG_PARSE_MODE", "HTML")
 
+# Preenche destinos AGORA, fora do corpo da classe (evita NameError)
+Config.DESTINOS = _build_destinos(Config.ORIGEM)
 
-# Credenciais / ambiente Amadeus
+# =========================
+# Credenciais / Ambiente
+# =========================
+
 CLIENT_ID = os.getenv("AMADEUS_API_KEY")
 CLIENT_SECRET = os.getenv("AMADEUS_API_SECRET")
 ENV = os.getenv("AMADEUS_ENV", "sandbox").strip().lower()
 BASE_URL = "https://test.api.amadeus.com" if ENV in ("sandbox", "test") else "https://api.amadeus.com"
 
-# Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-# Também espelhar alguns valores globais (para testes alterarem)
+# Para os testes poderem ajustar sem mexer em Config
 MAX_PRECO_PP = Config.MAX_PRECO_PP
 MIN_DISCOUNT_PCT = Config.MIN_DISCOUNT_PCT
 
-# Sessão HTTP (para GETs), com headers
+# Sessão HTTP com User-Agent
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": Config.USER_AGENT})
 
 CSV_HEADERS = [
     "ts_utc","origem","destino","departure_date","return_date",
-    "price_total","currency","leg_out_price","leg_out_airline","leg_ret_price","leg_ret_airline",
+    "price_total","currency",
+    "leg_out_price","leg_out_airline",
+    "leg_ret_price","leg_ret_airline",
     "notified","reason","deeplink"
 ]
 
@@ -147,7 +164,6 @@ def tg_send(text: str):
         log(f"Erro Telegram: {e}", "ERROR")
 
 def google_flights_deeplink(orig: str, dest: str, ida: str, volta: Optional[str]) -> str:
-    # Simples e estável, sem codificação extra
     if volta:
         return f"https://www.google.com/travel/flights?q=Flights%20from%20{orig}%20to%20{dest}%20on%20{ida}%20return%20{volta}"
     return f"https://www.google.com/travel/flights?q=Flights%20from%20{orig}%20to%20{dest}%20on%20{ida}"
@@ -157,7 +173,7 @@ def google_flights_deeplink(orig: str, dest: str, ida: str, volta: Optional[str]
 # =========================
 
 def load_best_totals() -> Dict[Tuple[str, str], float]:
-    best = {}
+    best: Dict[Tuple[str,str], float] = {}
     if not Config.HISTORY_PATH.exists():
         return best
     try:
@@ -191,8 +207,8 @@ def append_history_row(row: Dict[str, str]):
 
 def get_token() -> str:
     """
-    Usa requests.post (não SESSION) para que os testes possam mockar m.requests.post.
-    Retry com backoff em caso de falha.
+    Usa requests.post (não SESSION) para facilitar monkeypatch nos testes.
+    Retry com backoff e timeouts.
     """
     if not CLIENT_ID or not CLIENT_SECRET:
         log("AMADEUS_API_KEY/AMADEUS_API_SECRET ausentes.", "ERROR")
@@ -203,11 +219,11 @@ def get_token() -> str:
             resp = requests.post(
                 f"{BASE_URL}/v1/security/oauth2/token",
                 data={
-                    "grant_type":"client_credentials",
+                    "grant_type": "client_credentials",
                     "client_id": CLIENT_ID,
-                    "client_secret": CLIENT_SECRET
+                    "client_secret": CLIENT_SECRET,
                 },
-                timeout=Config.REQUEST_TIMEOUT
+                timeout=Config.REQUEST_TIMEOUT,
             )
             if resp.status_code == 200:
                 return resp.json().get("access_token")
@@ -227,7 +243,7 @@ def buscar_one_way(token: str, origem: str, destino: str, departure_date: str, m
         "departureDate": departure_date,
         "adults": "1",
         "currencyCode": Config.CURRENCY,
-        "max": str(max_offers)
+        "max": str(max_offers),
     }
     headers = {"Authorization": f"Bearer {token}"}
     for attempt in range(1, Config.MAX_RETRIES + 1):
@@ -236,12 +252,11 @@ def buscar_one_way(token: str, origem: str, destino: str, departure_date: str, m
             if r.status_code == 200:
                 return r.json()
             if r.status_code == 429:
-                # rate limit
                 sleep_s = Config.BACKOFF_FACTOR * attempt + 1.0
                 log(f"429 Rate limit (tent {attempt}). Aguardando {sleep_s:.1f}s.", "WARNING")
                 time.sleep(sleep_s)
                 continue
-            log(f"HTTP {r.status_code} na busca {origem}->{destino} {departure_date}: {r.text[:200]}", "WARNING")
+            log(f"HTTP {r.status_code} {origem}->{destino} {departure_date}: {r.text[:200]}", "WARNING")
         except requests.RequestException as e:
             log(f"Erro rede {origem}->{destino} {departure_date}: {e}", "WARNING")
         time.sleep(Config.BACKOFF_FACTOR * attempt)
@@ -262,7 +277,7 @@ def _cheapest(offers: Optional[dict]) -> Optional[dict]:
     try:
         cheapest = min(
             offers["data"],
-            key=lambda x: _safe_float(x.get("price", {}).get("total"), math.inf)
+            key=lambda x: _safe_float(x.get("price", {}).get("total"), math.inf),
         )
         cheapest["airline"] = _extract_airline_name(cheapest)
         return cheapest
@@ -270,23 +285,21 @@ def _cheapest(offers: Optional[dict]) -> Optional[dict]:
         return None
 
 # =========================
-# Regras de alerta (testadas)
+# Regras de alerta (usadas nos testes)
 # =========================
 
 def deve_alertar(preco_atual: float, melhor_anterior: Optional[float]) -> Tuple[bool, str]:
     """
-    Mantém a assinatura esperada pelos testes:
-      deve_alertar(preco_atual=..., melhor_anterior=...)
     Regras:
-      - Se preco_atual <= MAX_PRECO_PP  -> alerta ("≤ teto {MAX_PRECO_PP:g}")
-      - Senão, se houver melhor_anterior e queda >= MIN_DISCOUNT_PCT -> alerta ("queda {pct:.0%}")
-      - Caso contrário, sem alerta ("sem queda")
+      - Se preco_atual <= MAX_PRECO_PP -> alerta ("≤ teto {MAX_PRECO_PP}")
+      - Senão, se queda >= MIN_DISCOUNT_PCT vs melhor_anterior -> alerta ("queda {pct:.0%}")
+      - Caso contrário -> ("sem queda")
     """
-    # CAP por trecho
     if preco_atual <= MAX_PRECO_PP:
-        return True, f"≤ teto {int(MAX_PRECO_PP) if MAX_PRECO_PP.is_integer() else MAX_PRECO_PP:g}"
+        # formata sem .0 se inteiro
+        cap = int(MAX_PRECO_PP) if MAX_PRECO_PP.is_integer() else MAX_PRECO_PP
+        return True, f"≤ teto {cap}"
 
-    # Queda percentual vs melhor histórico
     if melhor_anterior is not None and math.isfinite(melhor_anterior) and melhor_anterior > 0:
         queda = (melhor_anterior - preco_atual) / melhor_anterior
         if queda >= MIN_DISCOUNT_PCT:
@@ -298,22 +311,31 @@ def deve_alertar(preco_atual: float, melhor_anterior: Optional[float]) -> Tuple[
 # Lógica principal (ida + volta)
 # =========================
 
-def gerar_datas_ida(hoje: datetime.date) -> List[str]:
-    # amostra de datas (aleatórias) dentro do intervalo
+def _datas_ida(hoje: datetime.date) -> List[str]:
     out = set()
     while len(out) < Config.SAMPLE_DEPARTURES:
         delta = random.randint(Config.DAYS_AHEAD_FROM, Config.DAYS_AHEAD_TO)
         out.add((hoje + timedelta(days=delta)).strftime("%Y-%m-%d"))
     return sorted(out)
 
-def datas_retorno(ida: str) -> List[str]:
+def _datas_retorno(ida: str) -> List[str]:
     d = datetime.strptime(ida, "%Y-%m-%d").date()
-    outs = []
-    for n in range(Config.STAY_NIGHTS_MIN, Config.STAY_NIGHTS_MAX + 1):
-        outs.append((d + timedelta(days=n)).strftime("%Y-%m-%d"))
-    return outs
+    return [(d + timedelta(days=n)).strftime("%Y-%m-%d") for n in range(Config.STAY_NIGHTS_MIN, Config.STAY_NIGHTS_MAX + 1)]
 
-def format_msg_roundtrip(orig, dest, date_out, out_offer, ret_date, ret_offer, motivo, deeplink, alts_text=""):
+def _format_return_alts(melhores_voltas: List[Tuple[str, dict, float]]) -> str:
+    if not Config.SHOW_RETURN_ALTS or len(melhores_voltas) <= 1:
+        return ""
+    base_date, base_offer, base_price = melhores_voltas[0]
+    others = []
+    for r_date, r_offer, r_price in melhores_voltas[1:Config.ALT_TOP_N + 1]:
+        saving = r_price - base_price
+        if saving >= Config.ALT_MIN_SAVING_BRL:
+            others.append(f"• {r_date}: {r_price:.2f} {Config.CURRENCY} ({r_offer.get('airline','N/A')})")
+    if not others:
+        return ""
+    return "<i>Alternativas de volta:</i>\n" + "\n".join(others)
+
+def _format_msg_roundtrip(orig, dest, date_out, out_offer, ret_date, ret_offer, motivo, deeplink, alts_text=""):
     p_out = _safe_float(out_offer["price"]["total"])
     p_ret = _safe_float(ret_offer["price"]["total"])
     tot = p_out + p_ret
@@ -333,21 +355,18 @@ def format_msg_roundtrip(orig, dest, date_out, out_offer, ret_date, ret_offer, m
     return "\n".join(lines)
 
 def process_destino_roundtrip(token: str, origem: str, destino: str, best_totals: Dict[Tuple[str,str], float], deadline: float):
-    # amostra de idas
-    for ida in gerar_datas_ida(datetime.utcnow().date()):
+    for ida in _datas_ida(datetime.utcnow().date()):
         if time.time() >= deadline:
             log("Time budget esgotado.", "WARNING")
             return
         time.sleep(Config.REQUEST_DELAY)
 
-        # menor ida
         off_ida = _cheapest(buscar_one_way(token, origem, destino, ida, Config.MAX_OFFERS))
         if not off_ida:
             continue
         preco_ida = _safe_float(off_ida["price"]["total"])
 
-        # todas as voltas possíveis
-        ret_dates = datas_retorno(ida)
+        ret_dates = _datas_retorno(ida)
         melhores_voltas: List[Tuple[str, dict, float]] = []
         for r in ret_dates:
             if time.time() >= deadline:
@@ -364,23 +383,22 @@ def process_destino_roundtrip(token: str, origem: str, destino: str, best_totals
         if not melhores_voltas:
             continue
 
-        # ordena por preço da volta
         melhores_voltas.sort(key=lambda x: x[2])
         ret_date, ret_offer, preco_ret = melhores_voltas[0]
         total = preco_ida + preco_ret
 
-        # aplica regras de alerta por trecho (se exigido)
+        # Regras rígidas de teto por trecho (se habilitadas)
         if Config.LEG_CAP_ENFORCE_BOTH and (preco_ida > Config.MAX_PRECO_PP or preco_ret > Config.MAX_PRECO_PP):
-            # não alerta se qualquer trecho passou do teto
             continue
 
-        # aplica regra de teto absoluto por trecho (se ONLY_CAP_BELOW=True)
+        # Modo "somente abaixo do teto nos 2 trechos"
         if Config.ONLY_CAP_BELOW:
             if preco_ida <= Config.MAX_PRECO_PP and preco_ret <= Config.MAX_PRECO_PP:
-                motivo = f"≤ teto {int(Config.MAX_PRECO_PP) if Config.MAX_PRECO_PP.is_integer() else Config.MAX_PRECO_PP:g}"
+                cap = int(Config.MAX_PRECO_PP) if Config.MAX_PRECO_PP.is_integer() else Config.MAX_PRECO_PP
+                motivo = f"≤ teto {cap}"
                 deeplink = google_flights_deeplink(origem, destino, ida, ret_date)
-                msg = format_msg_roundtrip(origem, destino, ida, off_ida, ret_date, ret_offer, motivo, deeplink,
-                                           alts_text=_format_return_alts(melhores_voltas))
+                msg = _format_msg_roundtrip(origem, destino, ida, off_ida, ret_date, ret_offer, motivo, deeplink,
+                                            alts_text=_format_return_alts(melhores_voltas))
                 tg_send(msg)
                 append_history_row({
                     "ts_utc": datetime.utcnow().isoformat()+"Z",
@@ -398,21 +416,19 @@ def process_destino_roundtrip(token: str, origem: str, destino: str, best_totals
                     "reason": motivo,
                     "deeplink": deeplink
                 })
-                # atualiza melhor total histórico
                 key = (origem, destino)
                 if key not in best_totals or total < best_totals[key]:
                     best_totals[key] = total
-            # caso contrário não notifica nada
             continue
 
-        # regra mix: teto OU queda vs histórico
+        # Regra de queda vs histórico (total)
         key = (origem, destino)
         melhor_hist = best_totals.get(key, math.inf)
         ok, motivo = deve_alertar(total, melhor_hist if math.isfinite(melhor_hist) else None)
         if ok:
             deeplink = google_flights_deeplink(origem, destino, ida, ret_date)
-            msg = format_msg_roundtrip(origem, destino, ida, off_ida, ret_date, ret_offer, motivo, deeplink,
-                                       alts_text=_format_return_alts(melhores_voltas))
+            msg = _format_msg_roundtrip(origem, destino, ida, off_ida, ret_date, ret_offer, motivo, deeplink,
+                                        alts_text=_format_return_alts(melhores_voltas))
             tg_send(msg)
             append_history_row({
                 "ts_utc": datetime.utcnow().isoformat()+"Z",
@@ -450,29 +466,14 @@ def process_destino_roundtrip(token: str, origem: str, destino: str, best_totals
                 "deeplink": google_flights_deeplink(origem, destino, ida, ret_date)
             })
 
-def _format_return_alts(melhores_voltas: List[Tuple[str, dict, float]]) -> str:
-    if not Config.SHOW_RETURN_ALTS or len(melhores_voltas) <= 1:
-        return ""
-    base_date, base_offer, base_price = melhores_voltas[0]
-    others = []
-    for r_date, r_offer, r_price in melhores_voltas[1:Config.ALT_TOP_N+1]:
-        saving = r_price - base_price
-        if saving >= Config.ALT_MIN_SAVING_BRL:
-            others.append(f"• {r_date}: {r_price:.2f} {Config.CURRENCY} ({r_offer.get('airline','N/A')})")
-    if not others:
-        return ""
-    return "<i>Alternativas de volta:</i>\n" + "\n".join(others)
-
 # =========================
 # Main
 # =========================
 
 def main():
     log(f"Iniciando monitor | ENV={ENV} ({'🚀 PRODUÇÃO' if ENV=='production' else '🧪 SANDBOX'}) | BASE={BASE_URL}")
-
     token = get_token()
     best_totals = load_best_totals()
-
     deadline = time.time() + Config.TIME_BUDGET_SECONDS
 
     for dest in Config.DESTINOS:
