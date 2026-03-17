@@ -1,0 +1,32 @@
+﻿name: Monitor de Passagens GYN
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  executar:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Bibliotecas
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Rodar Monitor
+      env:
+        SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        ORIGEM: "GYN"
+      run: python monitor_passagens.py
