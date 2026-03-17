@@ -1,13 +1,31 @@
-# Python
+# --- Python & Ambiente ---
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .venv/
 venv/
+ENV/
 .env
+.python-version
 
-# Data
+# --- Banco de Dados e Logs (CRÍTICO) ---
+# Ignoramos o .db para o GitHub não tentar sincronizar dados locais com a nuvem
+*.db
+data/*.db
+*.log
+data/*.log
+
+# --- Dados e Temporários ---
 data/*.csv
+data/*.json
 !data/.keep
-
-# pytest
 .pytest_cache/
+
+# --- Ferramentas de Edição ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- GitHub Actions local (se usar nektos/act) ---
+.artifacts/
