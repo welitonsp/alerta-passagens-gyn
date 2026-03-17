@@ -1,206 +1,111 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-from __future__ import annotations
-
 import os
-import random
-from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Dict, Optional
-from concurrent.futures import ThreadPoolExecutor
-
 import requests
+import json
+import logging
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from serpapi import GoogleSearch
+from gemini_agent import analisar_oferta_com_ia # Importa sua lógica de IA
 
-# Importações dos nossos módulos personalizados
-from database import logger, init_db, salvar_historico_db
-from gemini_agent import gerar_dica_turismo
-
-# Carrega as variáveis do ficheiro .env
+# 1. Configurações Iniciais
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-# ==========================================================
-# CONFIGURAÇÃO DE ESPECIALISTA
-# ==========================================================
+# Chaves de Ambiente
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+ORIGEM = "GYN"
 
-class Config:
-    ORIGEM = os.getenv("ORIGEM", "GYN").strip().upper()
-    
-    # Destinos padrão caso não estejam no .env
-    DESTINOS_RAW = os.getenv("DESTINOS", "SSA,REC,FOR,MCZ,NAT,GIG,SDU,BSB,FLN,POA,CWB")
-    DESTINOS = [d.strip().upper() for d in DESTINOS_RAW.split(",") if d.strip()]
+# 2. Configuração de Destinos e Tetos (Preços Reais)
+DESTINOS = [
+    {"iata": "GIG", "nome": "Rio de Janeiro", "teto": 550.0},
+    {"iata": "SSA", "nome": "Salvador", "teto": 850.0},
+    {"iata": "MCZ", "nome": "Maceió", "teto": 1200.0},
+    {"iata": "FLN", "nome": "Florianópolis", "teto": 700.0},
+    {"iata": "FOR", "nome": "Fortaleza", "teto": 1050.0}
+]
 
-    MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))
-    DESTINOS_POR_EXEC = int(os.getenv("DESTINOS_POR_EXEC", "3"))
-    SERPAPI_KEY = os.getenv("SERPAPI_KEY")
-    CURRENCY = "BRL"
-
-    # MODO DE TESTE: Se for True, ele envia a mensagem pro Telegram ignorando o preço.
-    # No dia a dia, deixe como False.
-    MODO_TESTE = True 
-
-# ==========================================================
-# REGRAS DE NEGÓCIO: TETOS DINÂMICOS POR DESTINO
-# ==========================================================
-# O robô agora sabe quanto vale a pena pagar para cada lugar saindo de GYN.
-TETOS_POR_DESTINO = {
-    "BSB": 250.0,  # Brasília é perto, passagem cara não compensa
-    "CWB": 500.0,
-    "FLN": 550.0,
-    "SDU": 450.0,  # Rio de Janeiro
-    "GIG": 450.0,
-    "POA": 600.0,
-    "SSA": 700.0,  # Nordeste começa a ficar mais caro
-    "MCZ": 800.0,
-    "REC": 850.0,
-    "NAT": 900.0,
-    "FOR": 950.0   # Fortaleza é mais longe, teto maior
-}
-
-# Preço de segurança caso você adicione um destino novo que não está na lista acima
-TETO_PADRAO_FALLBACK = 600.0 
-
-# ==========================================================
-# MOTOR DE BUSCA (GOOGLE FLIGHTS VIA SERPAPI)
-# ==========================================================
-
-def buscar_voo_google(origem: str, destino: str, data: str) -> Optional[Dict]:
-    """Procura voos reais no Google Flights usando a SerpApi (Apenas Ida)."""
-    if not Config.SERPAPI_KEY:
-        logger.error("SERPAPI_KEY não encontrada no ambiente ou .env")
-        return None
-
-    params = {
-        "engine": "google_flights",
-        "departure_id": origem,
-        "arrival_id": destino,
-        "outbound_date": data,
-        "currency": Config.CURRENCY,
-        "hl": "pt",
-        "type": "2", # 2 = Apenas Ida
-        "api_key": Config.SERPAPI_KEY
-    }
-
-    try:
-        search = GoogleSearch(params)
-        results = search.get_dict()
-        
-        if "best_flights" in results and results["best_flights"]:
-            best = results["best_flights"][0]
-            return {
-                "preco": float(best["price"]),
-                "companhia": best["flights"][0]["airline"],
-                "link": results.get("search_metadata", {}).get("google_flights_url")
-            }
-        
-        elif "other_flights" in results and results["other_flights"]:
-            other = results["other_flights"][0]
-            return {
-                "preco": float(other["price"]),
-                "companhia": other["flights"][0]["airline"],
-                "link": results.get("search_metadata", {}).get("google_flights_url")
-            }
-            
-    except Exception as e:
-        logger.error(f"Erro na SerpApi para {origem}->{destino}: {e}")
-    
-    return None
-
-# ==========================================================
-# TELEGRAM
-# ==========================================================
-
-def tg_send(text: str):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    
-    if not token or not chat_id:
-        return
-
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False
-            },
-            timeout=20
-        )
-    except Exception as e:
-        logger.error(f"Erro no Telegram: {e}")
-
-# ==========================================================
-# LÓGICA DE PROCESSAMENTO
-# ==========================================================
-
-def process_dest(dest: str):
+def proximos_finais_de_semana(quantidade=4):
+    """Calcula as datas de ida (sexta) e volta (domingo) dos próximos finais de semana."""
+    finais = []
     hoje = datetime.now()
-    data_str = (hoje + timedelta(days=random.randint(15, 60))).strftime("%Y-%m-%d")
-
-    # Descobre qual é o preço teto para este destino específico
-    teto_maximo = TETOS_POR_DESTINO.get(dest, TETO_PADRAO_FALLBACK)
-
-    logger.info(f"Buscando: {Config.ORIGEM} -> {dest} para {data_str} (Teto: R$ {teto_maximo})")
     
-    resultado = buscar_voo_google(Config.ORIGEM, dest, data_str)
+    # Encontra a próxima sexta-feira
+    dias_para_sexta = (4 - hoje.weekday() + 7) % 7
+    if dias_para_sexta == 0: dias_para_sexta = 7 # Se hoje é sexta, pula para a próxima
     
-    if not resultado:
-        logger.warning(f"Nenhum voo encontrado para {dest}")
-        return
+    proxima_sexta = hoje + timedelta(days=dias_para_sexta)
+    
+    for i in range(quantidade):
+        ida = proxima_sexta + timedelta(weeks=i)
+        volta = ida + timedelta(days=2) # Domingo
+        finais.append((ida.strftime('%Y-%m-%d'), volta.strftime('%Y-%m-%d')))
+    
+    return finais
 
-    preco = resultado["preco"]
-    companhia = resultado["companhia"]
-    link = resultado["link"]
+def enviar_telegram(mensagem):
+    """Envia o alerta formatado para o seu Telegram."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": mensagem, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        logging.error(f"Erro ao enviar Telegram: {e}")
 
-    # Lógica Inteligente: Dispara se for barato OU se estivermos em modo de teste
-    if preco <= teto_maximo or Config.MODO_TESTE:
-        alerta_teste = "⚠️ [MODO DE TESTE ATIVADO]\n\n" if Config.MODO_TESTE else ""
-        
-        # IA gera a dica
-        dica_ia = gerar_dica_turismo(Config.ORIGEM, dest, preco)
-        bloco_ia = f"\n🤖 <b>Dica da IA:</b>\n<i>{dica_ia}</i>\n" if dica_ia else ""
+def buscar_passagens():
+    logging.info("--- Radar GYN 2.0: Iniciando Busca de Finais de Semana ---")
+    janelas_de_viagem = proximos_finais_de_semana(3) # Busca os próximos 3 FDS
+    
+    for destino in DESTINOS:
+        for ida, volta in janelas_de_viagem:
+            logging.info(f"Buscando: {ORIGEM} -> {destino['iata']} ({ida} a {volta})")
+            
+            params = {
+                "engine": "google_flights",
+                "departure_id": ORIGEM,
+                "arrival_id": destino['iata'],
+                "outbound_date": ida,
+                "return_date": volta,
+                "currency": "BRL",
+                "hl": "pt",
+                "api_key": SERPAPI_KEY
+            }
 
-        msg = f"""
-{alerta_teste}✈️ <b>PASSAGEM ENCONTRADA (REAL)</b>
+            try:
+                search = GoogleSearch(params)
+                results = search.get_dict()
+                voos = results.get("best_flights", [])
 
-📍 <b>Rota:</b> {Config.ORIGEM} → {dest}
-📅 <b>Data:</b> {data_str}
-🏢 <b>Cia:</b> {companhia}
+                if not voos:
+                    continue
 
-💰 <b>Preço:</b> R$ {preco:.2f} (Abaixo do teto de R$ {teto_maximo})
-{bloco_ia}
-🔎 <b>Link direto Google Flights:</b>
-{link}
-"""
-        tg_send(msg)
+                melhor_voo = voos[0]
+                preco = melhor_voo.get("price")
 
-    # Grava na Base de Dados sempre (para termos histórico e gerar gráficos depois)
-    salvar_historico_db({
-        "ts": datetime.now().isoformat(),
-        "origem": Config.ORIGEM,
-        "destino": dest,
-        "data": data_str,
-        "preco": preco
-    })
+                # Validação de Preço (Apenas se estiver abaixo do teto)
+                if preco and preco <= destino['teto']:
+                    # 3. Chama a IA para criar o comentário personalizado
+                    dica_ia = analisar_oferta_com_ia(destino['nome'], preco, destino['teto'])
+                    
+                    link = f"https://www.google.com/travel/flights?q=Flights%20to%20{destino['iata']}%20from%20{ORIGEM}%20on%20{ida}%20through%20{volta}"
+                    
+                    msg = (
+                        f"✈️ *PASSAGEM ENCONTRADA!*\n\n"
+                        f"📍 *Rota:* {ORIGEM} ➔ {destino['nome']}\n"
+                        f"📅 *Ida:* {ida} (Sexta)\n"
+                        f"📅 *Volta:* {volta} (Domingo)\n"
+                        f"💰 *Preço:* R$ {preco:.2f}\n\n"
+                        f"🤖 *Dica da IA:* {dica_ia}\n\n"
+                        f"🔗 [Ver no Google Flights]({link})"
+                    )
+                    
+                    enviar_telegram(msg)
+                    logging.info(f"✅ Alerta enviado para {destino['iata']}!")
 
-# ==========================================================
-# MAIN
-# ==========================================================
-
-def main():
-    init_db()
-    logger.info("--- Monitor FlightHunter (Smart Pricing) Iniciado ---")
-
-    destinos_amostra = random.sample(Config.DESTINOS, min(len(Config.DESTINOS), Config.DESTINOS_POR_EXEC))
-
-    with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
-        list(executor.map(process_dest, destinos_amostra))
-
-    logger.info("--- Monitor Finalizado ---")
+            except Exception as e:
+                logging.error(f"Erro na busca para {destino['iata']}: {e}")
 
 if __name__ == "__main__":
-    main()
+    buscar_passagens()
+    logging.info("--- Monitor Finalizado ---")
