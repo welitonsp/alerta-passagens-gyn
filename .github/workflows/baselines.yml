@@ -1,0 +1,29 @@
+name: Recalcular baselines
+
+on:
+  schedule:
+    - cron: "30 2 * * *"  # todos os dias 02:30 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-baselines:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Gerar baselines
+        run: python build_baselines.py
+      - name: Commit baselines (se mudou)
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(baselines): atualizar data/baselines.json"
+          file_pattern: data/baselines.json

@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Data
+data/*.csv
+!data/.keep
+
+# pytest
+.pytest_cache/
