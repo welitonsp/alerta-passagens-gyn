@@ -32,5 +32,12 @@ jobs:
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add data/baselines.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "📊 Atualizando baselines de preços" && git push)
+          
+          # Verifica se o ficheiro existe antes de tentar salvar
+          if [ -f data/baselines.json ]; then
+            git add data/baselines.json
+            git diff --quiet && git diff --staged --quiet || (git commit -m "📊 Atualizando baselines de preços" && git push)
+            echo "✅ Ficheiro salvo com sucesso!"
+          else
+            echo "⚠️ Ficheiro baselines.json não foi gerado nesta execução (talvez falte o banco de dados). Pulando o commit."
+          fi
