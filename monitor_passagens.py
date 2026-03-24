@@ -5,9 +5,10 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from serpapi import GoogleSearch
 
-# Importa sua IA configurada
+# Importa a tua IA configurada
 from gemini_agent import gerar_dica_turismo as analisar_oferta_com_ia
 
+# Carrega as variáveis de ambiente (chaves de API)
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
@@ -30,16 +31,20 @@ DESTINOS = [
 ]
 
 def gerar_janelas_futuras():
-    """Gera 3 finais de semana entre 3 e 6 meses à frente."""
+    """Gera 3 finais de semana (Sexta a Domingo) entre 3 e 6 meses à frente."""
     janelas = []
     hoje = datetime.now()
+    # Adiciona 90 dias (aprox. 3 meses) à data atual
     data_inicio_busca = hoje + timedelta(days=90)
 
     for i in range(3):
+        # Pula de 4 em 4 semanas para buscar os próximos fins de semana
         sexta = data_inicio_busca + timedelta(weeks=i * 4)
+        # Calcula quantos dias faltam para a próxima Sexta-feira (dia 4 na semana do Python)
         dias_para_sexta = (4 - sexta.weekday() + 7) % 7
         sexta = sexta + timedelta(days=dias_para_sexta)
         domingo = sexta + timedelta(days=2)
+        
         janelas.append((sexta.strftime('%Y-%m-%d'), domingo.strftime('%Y-%m-%d')))
 
     return janelas
@@ -64,13 +69,14 @@ def buscar_hotel(destino_nome: str, check_in: str, check_out: str) -> dict | Non
         if not hoteis:
             return None
 
-        # Pega o mais barato com preço extraído
+        # Filtra apenas os hotéis que têm o preço extraído corretamente
         hoteis_com_preco = [h for h in hoteis if h.get("total_rate", {}).get("extracted_lowest")]
         if not hoteis_com_preco:
             return None
 
+        # Ordena a lista de hotéis do mais barato para o mais caro
         hoteis_com_preco.sort(key=lambda h: h["total_rate"]["extracted_lowest"])
-        melhor = hoteis_com_preco[0]
+        melhor = hoteis_com_preco[0] # Pega o primeiro da lista (o mais barato)
 
         return {
             "nome": melhor.get("name", "Hotel"),
@@ -83,14 +89,21 @@ def buscar_hotel(destino_nome: str, check_in: str, check_out: str) -> dict | Non
         return None
 
 def enviar_telegram(mensagem: str):
+    """Envia uma mensagem formatada para o bot do Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": mensagem, "parse_mode": "Markdown", "disable_web_page_preview": True}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID, 
+        "text": mensagem, 
+        "parse_mode": "Markdown", 
+        "disable_web_page_preview": True
+    }
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         logging.error(f"Erro ao enviar Telegram: {e}")
 
 def buscar_passagens():
+    """Função principal que orquestra as buscas e alertas."""
     logging.info("═══ Radar 4.0 (Voo + Hotel) iniciado ═══")
     janelas = gerar_janelas_futuras()
 
@@ -115,17 +128,19 @@ def buscar_passagens():
                     results = search.get_dict()
                     voos = results.get("best_flights", [])
 
+                    # Se não encontrar voos, passa para a próxima data
                     if not voos: continue
 
                     melhor_voo = voos[0]
                     preco = melhor_voo.get("price")
 
+                    # Se não tiver preço ou for mais caro que o teto, ignora
                     if not preco or preco > destino["teto"]: continue
 
                     # 1. IA cria a dica de roteiro
                     dica_ia = analisar_oferta_com_ia(origem["nome"], destino["nome"], preco)
 
-                    # 2. Busca de Hotel para formar o pacote
+                    # 2. Busca de Hotel para formar o pacote (SÓ FAZ ISSO SE O VOO FOR BARATO!)
                     hotel = buscar_hotel(destino["nome"], ida, volta)
                     bloco_hotel = ""
                     
@@ -139,13 +154,15 @@ def buscar_passagens():
                         if hotel["link"]:
                             bloco_hotel += f"   🔗 [Ver Hotel]({hotel['link']})\n"
 
+                    # Melhoria no link do voo para redirecionar de forma mais segura
                     link_voo = f"https://www.google.com/travel/flights?q=Flights%20to%20{destino['iata']}%20from%20{origem['iata']}%20on%20{ida}%20through%20{volta}"
 
+                    # CORREÇÃO AQUI: Adicionado o \n no final da linha do Voo
                     msg = (
                         f"🌟 *PROMOÇÃO DETECTADA (3-6 Meses)*\n\n"
                         f"🛫 *Rota:* {origem['nome']} → {destino['nome']}\n"
                         f"📅 *FDS:* {ida} a {volta}\n"
-                        f"💰 *Voo Ida e Volta:* R$ {preco:.2f}"
+                        f"💰 *Voo Ida e Volta:* R$ {preco:.2f}\n" 
                         f"{bloco_hotel}\n"
                         f"🤖 *Consultor IA:* {dica_ia}\n\n"
                         f"✈️ [RESERVAR VOO]({link_voo})"
