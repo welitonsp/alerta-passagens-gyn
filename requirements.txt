@@ -2,3 +2,4 @@ google-generativeai
 google-search-results
 python-dotenv
 requests
+psycopg2-binary
