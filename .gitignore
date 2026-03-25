@@ -19,6 +19,7 @@ data/*.log
 data/*.csv
 data/*.json
 !data/.keep
+!data/baselines.json
 .pytest_cache/
 
 # --- Ferramentas de Edição ---
