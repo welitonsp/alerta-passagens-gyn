@@ -8,6 +8,9 @@ from serpapi import GoogleSearch
 # Importa a tua IA configurada
 from gemini_agent import gerar_dica_turismo as analisar_oferta_com_ia
 
+# NOVOS IMPORTS DO BANCO DE DADOS EM NUVEM
+from database import init_db, salvar_historico_db
+
 # Carrega as variáveis de ambiente (chaves de API)
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -105,6 +108,10 @@ def enviar_telegram(mensagem: str):
 def buscar_passagens():
     """Função principal que orquestra as buscas e alertas."""
     logging.info("═══ Radar 4.0 (Voo + Hotel) iniciado ═══")
+    
+    # INICIALIZA O BANCO DE DADOS EM NUVEM AQUI
+    init_db()
+    
     janelas = gerar_janelas_futuras()
 
     for origem in ORIGENS:
@@ -137,6 +144,15 @@ def buscar_passagens():
                     # Se não tiver preço ou for mais caro que o teto, ignora
                     if not preco or preco > destino["teto"]: continue
 
+                    # SALVA O PREÇO NO BANCO DE DADOS EM NUVEM (SUPABASE)
+                    salvar_historico_db({
+                        "ts": datetime.utcnow().isoformat() + "Z",
+                        "origem": origem["iata"],
+                        "destino": destino["iata"],
+                        "data": ida,
+                        "preco": float(preco)
+                    })
+
                     # 1. IA cria a dica de roteiro
                     dica_ia = analisar_oferta_com_ia(origem["nome"], destino["nome"], preco)
 
@@ -157,7 +173,6 @@ def buscar_passagens():
                     # Melhoria no link do voo para redirecionar de forma mais segura
                     link_voo = f"https://www.google.com/travel/flights?q=Flights%20to%20{destino['iata']}%20from%20{origem['iata']}%20on%20{ida}%20through%20{volta}"
 
-                    # CORREÇÃO AQUI: Adicionado o \n no final da linha do Voo
                     msg = (
                         f"🌟 *PROMOÇÃO DETECTADA (3-6 Meses)*\n\n"
                         f"🛫 *Rota:* {origem['nome']} → {destino['nome']}\n"
