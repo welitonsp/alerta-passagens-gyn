@@ -2,7 +2,7 @@ name: Monitor de Passagens GYN
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 10,22 * * *'
   workflow_dispatch:
 
 jobs:
@@ -22,12 +22,14 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
+    - name: Instalar Navegador Playwright
+      run: playwright install --with-deps chromium
+
     - name: Rodar Monitor
       env:
         SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        DATABASE_URL: ${{ secrets.DATABASE_URL }} # <--- ESSA É A LINHA MÁGICA QUE FALTAVA!
-        ORIGEM: "GYN"
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
       run: python monitor_passagens.py
