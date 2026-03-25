@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import json, math, sqlite3
+import json, math
 from datetime import datetime, date
 from pathlib import Path
 from collections import defaultdict
+import psycopg2
+from psycopg2.extras import DictCursor
 
-# Importa a configuração da base de dados e logs
-from database import DB_PATH, logger
+# Importa a conexão com o Supabase do nosso arquivo database.py
+from database import get_connection, logger
 
 OUT_PATH = Path("data/baselines.json")
+# Garante que a pasta data existe
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 def _parse_date(s: str) -> date:
-    # Extrai apenas a data, caso exista informação de horas
     return datetime.fromisoformat(s[:10]).date()
 
 def _parse_ts(s: str) -> date:
-    # Converte o timestamp UTC
     return datetime.fromisoformat(s.replace("Z","+00:00")).date()
 
 def _d_days(dep: date, collected: date) -> int:
@@ -38,22 +40,19 @@ def pct(vals, q):
     return vals[i]
 
 def main():
-    if not Path(DB_PATH).exists():
-        logger.warning("Base de dados não encontrada; nada a calcular para as baselines.")
+    conn = get_connection()
+    if not conn:
+        logger.error("Sem conexão com o Supabase. Abortando cálculo de baselines.")
         return
         
     buckets = defaultdict(list)
     
-    # Ligar à base de dados SQLite
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
     try:
-        cursor.execute("SELECT origem, destino, data, ts, preco FROM historico")
-        rows = cursor.fetchall()
-    except sqlite3.OperationalError as e:
-        logger.error(f"Erro ao ler base de dados: {e}")
+        with conn.cursor(cursor_factory=DictCursor) as cursor:
+            cursor.execute("SELECT origem, destino, data, ts, preco FROM historico")
+            rows = cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Erro ao ler banco de dados: {e}")
         return
     finally:
         conn.close()
@@ -79,13 +78,12 @@ def main():
     out = {}
     for k, vals in buckets.items():
         if len(vals) < 3:
-            # Poucos dados, salva apenas a mediana (p50)
             out[k] = {"p10": None, "p25": None, "p50": pct(vals, 0.5)}
         else:
             out[k] = {"p10": pct(vals, 0.10), "p25": pct(vals, 0.25), "p50": pct(vals, 0.50)}
             
     OUT_PATH.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info(f"Baselines guardadas em {OUT_PATH} ({len(out)} rotas analisadas).")
+    logger.info(f"Baselines guardadas com sucesso ({len(out)} rotas analisadas).")
 
 if __name__ == "__main__":
     main()
