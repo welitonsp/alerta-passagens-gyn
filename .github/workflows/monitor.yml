@@ -10,10 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout
-      uses: actions/checkout@v4 # <-- Atualizado de v3 para v4
+      uses: actions/checkout@v4
 
     - name: Python
-      uses: actions/setup-python@v5 # <-- Atualizado de v4 para v5
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
@@ -28,5 +28,6 @@ jobs:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        DATABASE_URL: ${{ secrets.DATABASE_URL }} # <--- ESSA É A LINHA MÁGICA QUE FALTAVA!
         ORIGEM: "GYN"
       run: python monitor_passagens.py
