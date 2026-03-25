@@ -1,4 +1,4 @@
-google-generativeai
+google-genai
 google-search-results
 python-dotenv
 requests
