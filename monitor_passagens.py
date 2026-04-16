@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from serpapi import GoogleSearch
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-from gemini_agent import gerar_dica_turismo as analisar_oferta_com_ia
+from gemini_agent import analisar_oferta_com_ia
 # Importamos as novas funções do banco
 from database import init_db, salvar_historico_db, verificar_alerta_duplicado, registrar_alerta, DATA_DIR
 
@@ -186,7 +186,7 @@ def buscar_passagens():
             logging.info(f"🔕 Alerta duplicado ignorado. Já notificamos essa mesma viagem nas últimas 24h.")
         else:
             logging.info(f"✅ Promocão inédita! R${preco_final} via {fonte_vencedora}. Gerando alerta...")
-            dica_ia = analisar_oferta_com_ia(origem["nome"], destino["nome"], preco_final)
+            dica_ia = analisar_oferta_com_ia(origem["nome"], destino["nome"], preco_final, teto_alerta, status_promo)
             hotel = buscar_hotel(destino["nome"], ida, volta)
             
             bloco_hotel = ""

@@ -12,29 +12,54 @@ if CHAVE_API:
 else:
     client = None
 
-def analisar_oferta_com_ia(origem: str, destino: str, preco: float) -> str:
-    """Gera uma análise completa: Dica + Hospedagem + Roteiro Curto"""
+def analisar_oferta_com_ia(origem: str, destino: str, preco: float, teto_alerta: float = 0.0, status_promo: str = "") -> str:
+    """Gera análise de oferta baseada em dados estatísticos reais do baseline."""
     if not client:
         return "Preço excelente! Garanta sua viagem."
 
-    try:
-        prompt = (
-            f"Atue como um consultor de viagens expert. "
-            f"Achei um voo de {origem} para {destino} por R$ {preco:.2f} (ida e volta no fim de semana). "
-            f"1. Dê um motivo real por que esse preço está bom. "
-            f"2. Sugira um bairro com bom custo-benefício para se hospedar em {destino}. "
-            f"3. Sugira uma atividade gratuita ou barata para o sábado à tarde. "
-            f"Seja direto, use no máximo 350 caracteres e alguns emojis."
+    economia = teto_alerta - preco
+    percentual_economia = (economia / teto_alerta * 100) if teto_alerta > 0 else 0
+
+    if percentual_economia >= 30:
+        urgencia = "🚨 ALERTA DE PROMOÇÃO REAL 🚨"
+    elif percentual_economia >= 15:
+        urgencia = "✅ Boa oportunidade detectada"
+    elif percentual_economia >= 5:
+        urgencia = "👀 Preço levemente abaixo do normal"
+    else:
+        urgencia = "ℹ️ Preço dentro do esperado"
+
+    if teto_alerta > 0:
+        contexto_stats = (
+            f"Preço atual: R$ {preco:.2f}/pessoa | "
+            f"Preço de referência: R$ {teto_alerta:.2f} | "
+            f"Economia: R$ {economia:.2f} ({percentual_economia:.0f}%) | "
+            f"Classificação: {status_promo}"
         )
-        
-        # A nova forma de gerar conteúdo no pacote google-genai
+        instrucao = (
+            f"1. Se economia ≥ 15%: explica que é oportunidade real (cite os valores). "
+            f"2. Se economia < 15%: informa que está dentro do normal. "
+        )
+    else:
+        contexto_stats = f"Preço atual: R$ {preco:.2f}/pessoa"
+        instrucao = "1. Dê um motivo real por que esse preço está bom. "
+
+    prompt = (
+        f"Atue como consultor de tarifas aéreas. "
+        f"Rota: {origem} → {destino}. {contexto_stats}. "
+        f"{instrucao}"
+        f"3. Adiciona 1 dica turística rápida de {destino}. "
+        f"Máximo 300 caracteres. Use emojis. "
+        f"Formato: [{urgencia}] / [Análise] / [Dica turística]"
+    )
+
+    try:
         response = client.models.generate_content(
             model='gemini-1.5-flash',
             contents=prompt,
         )
         return response.text.strip()
     except Exception as e:
-        return f"Oportunidade incrível para {destino}! O preço está abaixo da média de mercado. ✈️"
+        return f"{urgencia}\n{origem}→{destino}: R${preco:.2f} (Ref: R${teto_alerta:.2f})"
 
-# Mantemos o nome da função que o seu monitor_passagens.py já conhece
 gerar_dica_turismo = analisar_oferta_com_ia
