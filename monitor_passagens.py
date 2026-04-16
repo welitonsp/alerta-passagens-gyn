@@ -28,7 +28,10 @@ SERPAPI_KEY       = os.getenv("SERPAPI_KEY")
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
 
-ORIGENS = [{"iata": "GYN", "nome": "Goiânia"}]
+ORIGENS = [
+    {"iata": "GYN", "nome": "Goiânia"},
+    {"iata": "BSB", "nome": "Brasília"},
+]
 
 DESTINOS = [
     {"iata": "RBR", "nome": "Rio Branco"}, {"iata": "MCZ", "nome": "Maceió"},
@@ -142,9 +145,13 @@ def buscar_passagens():
     params = {"engine": "google_flights", "departure_id": origem["iata"], "arrival_id": destino["iata"], "outbound_date": ida, "return_date": volta, "currency": "BRL", "hl": "pt", "api_key": SERPAPI_KEY, "adults": 2, "children": 2, "travel_class": 1, "bags": 0}
     preco_google, link_google = None, f"https://www.google.com/travel/flights?q=Flights%20to%20{destino['iata']}%20from%20{origem['iata']}%20on%20{ida}%20through%20{volta}"
     try:
-        voos_google = GoogleSearch(params).get_dict().get("best_flights", [])
-        if voos_google: preco_google = float(voos_google[0].get("price")) / 4  # Valor por pessoa
-    except Exception as e: logging.error(f"Erro no Google Flights: {e}")
+        results = GoogleSearch(params).get_dict()
+        voos_google = results.get("best_flights", [])
+        if voos_google:
+            preco_google = float(voos_google[0].get("price")) / 4  # Preço por pessoa
+            link_google = voos_google[0].get("link") or results.get("search_metadata", {}).get("google_flights_url", link_google)
+    except Exception as e:
+        logging.error(f"Erro no Google Flights: {e}")
 
     # 2. Delay de segurança para evitar rate-limit
     time.sleep(random.uniform(2, 5))
