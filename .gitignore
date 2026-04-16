@@ -30,3 +30,6 @@ Thumbs.db
 
 # --- GitHub Actions local (se usar nektos/act) ---
 .artifacts/
+
+# --- Arquivos do Claude Code ---
+.claude/
