@@ -20,7 +20,7 @@ SERPAPI_KEY       = os.getenv("SERPAPI_KEY")
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
 
-ORIGENS = [{"iata": "GYN", "nome": "Goiânia"}, {"iata": "CLV", "nome": "Caldas Novas"}]
+ORIGENS = [{"iata": "GYN", "nome": "Goiânia"}]
 
 DESTINOS = [
     {"iata": "RBR", "nome": "Rio Branco"}, {"iata": "MCZ", "nome": "Maceió"},
@@ -58,7 +58,8 @@ def buscar_maxmilhas_playwright(origem: str, destino: str, ida: str, volta: str)
                     preco_el = card.query_selector('text=/R\\$\\s*[0-9.]+/')
                     if not preco_el: preco_el = card.query_selector('span[class*="price"], div[class*="price"]')
                     preco_text = preco_el.inner_text().strip() if preco_el else "0"
-                    preco = float(''.join(filter(str.isdigit, preco_text.replace(',', '.'))))
+                    preco_text = preco_text.upper().replace('R$', '').replace('&NBSP;', '').replace(' ', '').replace('.', '').replace(',', '.')
+                    preco = float(preco_text)
                     
                     if preco >= 100: voos.append({"preco": round(preco, 2), "link": url, "fonte": "MaxMilhas"})
                 except Exception: continue
@@ -177,7 +178,7 @@ def buscar_passagens():
     # 4. DECISÃO FINAL: HASH E TELEGRAM
     if preco_final <= teto_alerta:
         # Criptografa os dados para criar a "Impressão Digital" única
-        string_hash = f"{origem['iata']}-{destino['iata']}-{ida}-{preco_final}".encode('utf-8')
+        string_hash = f"{origem['iata']}-{destino['iata']}-{ida}".encode('utf-8')
         hash_alerta = hashlib.md5(string_hash).hexdigest()
 
         # Verifica com o banco de dados se já enviamos isso hoje
