@@ -55,7 +55,7 @@ def buscar_maxmilhas_playwright(origem: str, destino: str, ida: str, volta: str)
     voos = []
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=False)
             page = browser.new_page()
             page.set_viewport_size({"width": 1280, "height": 800})
             
@@ -145,6 +145,8 @@ def buscar_passagens():
     preco_google, link_google = None, f"https://www.google.com/travel/flights?q=Flights%20to%20{destino['iata']}%20from%20{origem['iata']}%20on%20{ida}%20through%20{volta}"
     try:
         results = GoogleSearch(params).get_dict()
+        if "error" in results:
+            logging.error(f"🚨 ERRO SERPAPI: {results['error']}")
         voos_google = results.get("best_flights", [])
         if voos_google:
             preco_google = float(voos_google[0].get("price"))  # Preço por pessoa (1 adulto)
