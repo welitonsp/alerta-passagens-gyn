@@ -40,7 +40,7 @@ DESTINOS = [
 
 # ====================== PLAYWRIGHT MAXMILHAS ======================
 def buscar_maxmilhas_playwright(origem: str, destino: str, ida: str, volta: str):
-    url = f"https://www.maxmilhas.com.br/passagens-aereas?from={origem}&to={destino}&departure={ida}&return={volta}&adults=1&children=0&infants=0&type=roundtrip"
+    url = f"https://www.maxmilhas.com.br/passagens-aereas?from={origem}&to={destino}&departure={ida}&return={volta}&adults=2&children=2&infants=0&type=roundtrip"
     voos = []
     try:
         with sync_playwright() as p:
@@ -60,7 +60,8 @@ def buscar_maxmilhas_playwright(origem: str, destino: str, ida: str, volta: str)
                     preco_text = preco_el.inner_text().strip() if preco_el else "0"
                     preco_text = preco_text.upper().replace('R$', '').replace('&NBSP;', '').replace(' ', '').replace('.', '').replace(',', '.')
                     preco = float(preco_text)
-                    
+                    preco = preco / 4  # Divide o total por 4 para manter a métrica de preço unitário no banco
+
                     if preco >= 100: voos.append({"preco": round(preco, 2), "link": url, "fonte": "MaxMilhas"})
                 except Exception: continue
             
@@ -130,11 +131,11 @@ def buscar_passagens():
     logging.info(f"🔎 Analisando: {origem['iata']} → {destino['iata']}  [{ida} → {volta}]")
 
     # 1. Busca Google Flights
-    params = {"engine": "google_flights", "departure_id": origem["iata"], "arrival_id": destino["iata"], "outbound_date": ida, "return_date": volta, "currency": "BRL", "hl": "pt", "api_key": SERPAPI_KEY}
+    params = {"engine": "google_flights", "departure_id": origem["iata"], "arrival_id": destino["iata"], "outbound_date": ida, "return_date": volta, "currency": "BRL", "hl": "pt", "api_key": SERPAPI_KEY, "adults": 2, "children": 2, "travel_class": 1, "bags": 0}
     preco_google, link_google = None, f"https://www.google.com/travel/flights?q=Flights%20to%20{destino['iata']}%20from%20{origem['iata']}%20on%20{ida}%20through%20{volta}"
     try:
         voos_google = GoogleSearch(params).get_dict().get("best_flights", [])
-        if voos_google: preco_google = float(voos_google[0].get("price"))
+        if voos_google: preco_google = float(voos_google[0].get("price")) / 4  # Valor por pessoa
     except Exception as e: logging.error(f"Erro no Google Flights: {e}")
 
     # 2. Busca MaxMilhas

@@ -48,7 +48,7 @@ def analisar_oferta_com_ia(origem: str, destino: str, preco: float, teto_alerta:
         f"Atue como consultor de tarifas aéreas. "
         f"Rota: {origem} → {destino}. {contexto_stats}. "
         f"{instrucao}"
-        f"3. Adiciona 1 dica turística rápida de {destino}. "
+        f"3. Adiciona 1 dica turística gratuita ou barata em {destino} perfeita para um casal com duas crianças de 8 e 4 anos. "
         f"Máximo 300 caracteres. Use emojis. "
         f"Formato: [{urgencia}] / [Análise] / [Dica turística]"
     )
