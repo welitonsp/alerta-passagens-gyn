@@ -13,14 +13,6 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(DATA_DIR / "app.log", encoding="utf-8", delay=True),
-        logging.StreamHandler() 
-    ]
-)
 logger = logging.getLogger("FlightMonitor")
 
 # ==========================================================

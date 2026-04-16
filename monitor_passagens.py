@@ -1,9 +1,10 @@
 import os
 import json
 import random
+import time
 import requests
 import logging
-import hashlib # <--- NOVA BIBLIOTECA PARA CRIAR O HASH
+import hashlib
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from serpapi import GoogleSearch
@@ -14,7 +15,14 @@ from gemini_agent import analisar_oferta_com_ia
 from database import init_db, salvar_historico_db, verificar_alerta_duplicado, registrar_alerta, DATA_DIR
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(DATA_DIR / "app.log", encoding="utf-8", delay=True),
+        logging.StreamHandler(),
+    ],
+)
 
 SERPAPI_KEY       = os.getenv("SERPAPI_KEY")
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -138,7 +146,10 @@ def buscar_passagens():
         if voos_google: preco_google = float(voos_google[0].get("price")) / 4  # Valor por pessoa
     except Exception as e: logging.error(f"Erro no Google Flights: {e}")
 
-    # 2. Busca MaxMilhas
+    # 2. Delay de segurança para evitar rate-limit
+    time.sleep(random.uniform(2, 5))
+
+    # 3. Busca MaxMilhas
     voos_max = buscar_maxmilhas_playwright(origem["iata"], destino["iata"], ida, volta)
     preco_max = voos_max[0]["preco"] if voos_max else None
     link_max = voos_max[0]["link"] if voos_max else None
